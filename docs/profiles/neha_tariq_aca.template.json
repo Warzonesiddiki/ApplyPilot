@@ -1,0 +1,192 @@
+{
+  "domain": "finance_accounting",
+  "personal": {
+    "full_name": "Neha Tariq, ACA",
+    "preferred_name": "Neha",
+    "email": "nehatariqaca@gmail.com",
+    "password": "YOUR_JOB_SITE_PASSWORD",
+    "phone": "+92 334 518 4264",
+    "address": "Islamabad, Pakistan / Dubai, UAE (Relocating to UK / Ireland / EU)",
+    "city": "Islamabad",
+    "province_state": "Islamabad",
+    "country": "Pakistan",
+    "postal_code": "",
+    "linkedin_url": "https://www.linkedin.com/in/tariqneha",
+    "github_url": "",
+    "portfolio_url": "",
+    "website_url": ""
+  },
+  "work_authorization": {
+    "legally_authorized_to_work": "Requires Visa Sponsorship (Eligible for UK Skilled Worker / Irish Critical Skills Employment Permit / EU Blue Card / NL Highly Skilled Migrant)",
+    "require_sponsorship": "Yes",
+    "willing_to_relocate": "Yes",
+    "work_permit_type": "UK Skilled Worker / Irish Critical Skills / EU Blue Card",
+    "target_regions": [
+      "United Kingdom",
+      "Ireland",
+      "Netherlands",
+      "Germany",
+      "Luxembourg",
+      "Switzerland",
+      "Sweden",
+      "Denmark",
+      "Belgium",
+      "France",
+      "Spain",
+      "Portugal",
+      "Austria",
+      "Poland",
+      "Finland",
+      "Malta",
+      "Cyprus",
+      "European Union",
+      "EMEA Remote"
+    ]
+  },
+  "availability": {
+    "earliest_start_date": "Immediately (or 2-4 weeks for relocation)",
+    "notice_period": "1 month / 4 weeks",
+    "available_for_full_time": "Yes",
+    "available_for_contract": "Yes"
+  },
+  "compensation": {
+    "salary_expectation": "70000",
+    "salary_currency": "GBP",
+    "salary_range_min": "58000",
+    "salary_range_max": "90000",
+    "currency_conversion_note": "For UK roles use GBP (£58,000-£90,000). For Ireland/Eurozone roles use EUR (€68,000-€100,000 annual gross, or €5,700-€8,300/month gross). For Switzerland use CHF (CHF 115,000-145,000).",
+    "currencies": {
+      "GBP": {
+        "expectation": "70000",
+        "min": "58000",
+        "max": "90000",
+        "symbol": "£"
+      },
+      "EUR": {
+        "expectation": "80000",
+        "min": "68000",
+        "max": "100000",
+        "symbol": "€"
+      },
+      "CHF": {
+        "expectation": "125000",
+        "min": "115000",
+        "max": "145000",
+        "symbol": "CHF"
+      },
+      "USD": {
+        "expectation": "90000",
+        "min": "75000",
+        "max": "115000",
+        "symbol": "$"
+      }
+    }
+  },
+  "experience": {
+    "years_of_experience_total": "7",
+    "education_level": "Chartered Accountant (ACA - ICAP) | Associate Public Finance Accountant (APFA - PIPFA) | Bachelor of Commerce (B.Com, CGPA 3.75/4.00)",
+    "current_job_title": "FP&A Analyst",
+    "current_title": "FP&A Analyst",
+    "current_company": "Al-Ghurair",
+    "target_role": "Audit Manager / FP&A Manager / Financial Reporting Manager (ACA) / Senior FP&A Analyst"
+  },
+  "skills_boundary": {
+    "FP&A, Corporate Finance & Strategy": [
+      "Financial Planning and Analysis (FP&A)",
+      "Budgeting and Forecasting",
+      "Variance Analysis",
+      "Financial Modeling",
+      "DCF Analysis & Valuation",
+      "Scenario & Sensitivity Analysis",
+      "Business Partnering",
+      "Strategic Planning",
+      "M&A Due Diligence",
+      "Cash Flow Management",
+      "Working Capital Optimization"
+    ],
+    "Audit, Assurance & Accounting Standards": [
+      "IFRS Standards (IFRS 3, IFRS 9, IFRS 10, IFRS 15, IFRS 16)",
+      "ISA Standards (International Standards on Auditing)",
+      "US GAAP",
+      "UK GAAP / FRS 102",
+      "Multi-Entity Consolidations",
+      "Internal Controls",
+      "SOX Compliance",
+      "COSO Framework",
+      "Risk Assessment",
+      "External & Statutory Audit"
+    ],
+    "Taxation & Regulatory Compliance": [
+      "UAE Corporate Tax",
+      "VAT Compliance",
+      "FTA Regulations",
+      "ESR and UBO Compliance",
+      "AML and CFT Compliance",
+      "Transfer Pricing"
+    ],
+    "Financial Systems, Audit Tools & Analytics": [
+      "SAP",
+      "Oracle Financials",
+      "QuickBooks",
+      "Zoho Books",
+      "Tally ERP",
+      "Dynamics 365",
+      "Xpedeon",
+      "KPMG Clara",
+      "GT LEAP",
+      "Voyager",
+      "SmartAudit",
+      "CaseWare",
+      "Advanced Excel (VLOOKUP, Pivot Tables, Macros, Power Query)",
+      "Power BI",
+      "Tableau",
+      "SQL (Basic)",
+      "Data Visualization"
+    ]
+  },
+  "resume_facts": {
+    "preserved_companies": [
+      "Al-Ghurair",
+      "Finnet Global",
+      "Grant Thornton",
+      "KPMG Taseer Hadi and Co."
+    ],
+    "preserved_projects": [],
+    "preserved_school": "Institute of Chartered Accountants of Pakistan (ICAP)",
+    "certifications": [
+      "ACA - Chartered Accountant (Institute of Chartered Accountants of Pakistan - ICAP)",
+      "APFA - Associate Public Finance Accountant (PIPFA)",
+      "Bachelor of Commerce (B.Com), University of Lahore (CGPA: 3.75/4.00)"
+    ],
+    "real_metrics": [
+      "7+ years of progressive experience",
+      "30+ audits with zero restatements",
+      "100% regulatory compliance",
+      "annual budgets exceeding AED 100M",
+      "5-year long-range financial plans",
+      "variances exceeding AED 500K",
+      "25+ financial and operational metrics",
+      "4 divisions",
+      "improving forecast accuracy by 18%",
+      "AED 850K in annual cost savings",
+      "reducing DSO by 12 days",
+      "improving cash conversion cycle by 15%",
+      "8 entities",
+      "combined revenues exceeding AED 200M",
+      "team of 5 finance professionals",
+      "improving productivity by 25%",
+      "15+ clients with combined revenues exceeding AED 500M",
+      "reducing audit cycle time by 20%",
+      "95% client satisfaction rating",
+      "35+ junior staff members",
+      "8 receiving promotions",
+      "CGPA: 3.75/4.00"
+    ]
+  },
+  "eeo_voluntary": {
+    "gender": "Decline to self-identify",
+    "race_ethnicity": "Decline to self-identify",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not wish to answer"
+  }
+}

@@ -1,0 +1,181 @@
+{
+  "domain": "finance_accounting",
+  "personal": {
+    "full_name": "Tahir Siddique",
+    "preferred_name": "Tahir",
+    "email": "tahirsiddikinmk@gmail.com",
+    "password": "YOUR_JOB_SITE_PASSWORD",
+    "phone": "+971 58 959 2708",
+    "address": "Dubai, UAE (Relocating to UK / Ireland / EU)",
+    "city": "Dubai",
+    "province_state": "Dubai",
+    "country": "United Arab Emirates",
+    "postal_code": "",
+    "linkedin_url": "https://www.linkedin.com/in/tahirsiddiqi",
+    "github_url": "https://github.com/Warzonesiddiki",
+    "portfolio_url": "",
+    "website_url": ""
+  },
+  "work_authorization": {
+    "legally_authorized_to_work": "Requires Visa Sponsorship (UK Skilled Worker visa; Irish Employment Permit; EU Blue Card / Highly Skilled Migrant)",
+    "require_sponsorship": "Yes",
+    "willing_to_relocate": "Yes",
+    "work_permit_type": "UK Skilled Worker Visa / Irish Employment Permit / EU Work Permit",
+    "target_regions": [
+      "United Kingdom",
+      "Ireland",
+      "Netherlands",
+      "Germany",
+      "Luxembourg",
+      "Switzerland",
+      "Sweden",
+      "Denmark",
+      "Belgium",
+      "France",
+      "Spain",
+      "Portugal",
+      "Austria",
+      "Poland",
+      "Finland",
+      "European Union",
+      "EMEA Remote"
+    ]
+  },
+  "availability": {
+    "earliest_start_date": "Within 4 weeks of offer acceptance",
+    "notice_period": "4 weeks (available to relocate to UK, Ireland, or EU within 4 weeks)",
+    "available_for_full_time": "Yes",
+    "available_for_contract": "Yes"
+  },
+  "compensation": {
+    "salary_expectation": "55000",
+    "salary_currency": "GBP",
+    "salary_range_min": "45000",
+    "salary_range_max": "70000",
+    "currency_conversion_note": "For UK roles use GBP (£45,000-£70,000). For Ireland/Eurozone roles use EUR (€55,000-€80,000 annual gross, or €4,600-€6,700/month gross). For Switzerland use CHF (CHF 95,000-125,000).",
+    "currencies": {
+      "GBP": {
+        "expectation": "55000",
+        "min": "45000",
+        "max": "70000",
+        "symbol": "£"
+      },
+      "EUR": {
+        "expectation": "65000",
+        "min": "55000",
+        "max": "80000",
+        "symbol": "€"
+      },
+      "CHF": {
+        "expectation": "105000",
+        "min": "95000",
+        "max": "125000",
+        "symbol": "CHF"
+      },
+      "USD": {
+        "expectation": "70000",
+        "min": "60000",
+        "max": "90000",
+        "symbol": "$"
+      }
+    }
+  },
+  "experience": {
+    "years_of_experience_total": "6",
+    "education_level": "ACCA Finalist (11 of 13 exams passed, incl. SBR & ATX-UK) | Bachelor of Commerce (B.Com), Accounting & Finance",
+    "current_job_title": "Senior Accountant & ERP Implementation Specialist",
+    "current_title": "Senior Accountant & ERP Implementation Specialist",
+    "current_company": "Finnet Global",
+    "target_role": "Senior Accountant / Financial Accountant / Management Accountant / ERP Implementation Specialist"
+  },
+  "skills_boundary": {
+    "Financial Reporting & Accounting": [
+      "IFRS Statutory Accounts",
+      "IAS",
+      "FRS 102 / UK and Irish GAAP",
+      "Month-End & Year-End Close",
+      "Management Accounts & Board Packs",
+      "Multi-Entity Consolidation",
+      "Intercompany Reconciliations",
+      "Fixed Assets & Depreciation",
+      "Balance Sheet Reconciliations",
+      "General Ledger Management",
+      "Multi-Currency Transactions"
+    ],
+    "Taxation, Audit & Compliance": [
+      "UK Taxation (ACCA ATX-UK passed)",
+      "UK VAT & Corporation Tax Preparation and Filing",
+      "UAE VAT Returns & Compliance",
+      "UAE Corporate Tax Computations & FTA Filing",
+      "GST Compliance",
+      "External Audit Liaison & Audit Schedules",
+      "Internal Audit & Internal Controls",
+      "Regulatory Reporting"
+    ],
+    "FP&A, Planning & Financial Management": [
+      "Budgeting & Forecasting",
+      "Variance Analysis",
+      "Cash Flow & Working Capital Management",
+      "Capital Budgeting",
+      "Scenario & Strategic Planning",
+      "Discounted Cash Flow (DCF)",
+      "Comparable Company Analysis",
+      "KPI Dashboards & Performance Measurement"
+    ],
+    "ERP Systems & Reporting Tools": [
+      "Zoho Books",
+      "QuickBooks",
+      "Xero",
+      "Sage",
+      "Oracle",
+      "HYP ERP",
+      "SAP FI/CO",
+      "Tally Prime",
+      "ERP Implementation & Data Migration",
+      "Chart of Accounts Design",
+      "User Acceptance Testing (UAT)",
+      "Advanced Excel (Pivot Tables, INDEX-MATCH, Power Query, Macros)",
+      "Power BI"
+    ]
+  },
+  "resume_facts": {
+    "preserved_companies": [
+      "Finnet Global",
+      "Independent Practice",
+      "Inspirisys Solutions Limited",
+      "Bajaj Electricals Ltd",
+      "Sakarwala and Associates"
+    ],
+    "preserved_projects": [
+      "GST Project Consultant, Bajaj Electricals Ltd"
+    ],
+    "preserved_school": "University of Mumbai",
+    "certifications": [
+      "ACCA Finalist (11 of 13 exams passed, including Strategic Business Reporting SBR and Advanced Taxation ATX-UK)",
+      "UAE VAT Compliance, Federal Tax Authority (2023)",
+      "SAP FI/CO Fundamentals, SAP Learning Hub (2021)",
+      "Advanced Excel for Financial Professionals, LinkedIn Learning (2022)"
+    ],
+    "real_metrics": [
+      "6+ years' experience",
+      "11 of 13 exams passed",
+      "20+ client entities",
+      "reduced manual month-end close effort by approximately 30%",
+      "20+ clients across retail, trading and professional services",
+      "100% on-time compliance",
+      "reduced client tax liabilities by an average of 15%",
+      "500+ employee IT services organisation",
+      "INR 250,000 in process improvements and cost savings",
+      "INR 1.5M project budget",
+      "95% accuracy in pre-launch tax calculation validation",
+      "30+ clients across diverse industries",
+      "Cut average month-end close time by 2 days"
+    ]
+  },
+  "eeo_voluntary": {
+    "gender": "Decline to self-identify",
+    "race_ethnicity": "Decline to self-identify",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not wish to answer"
+  }
+}

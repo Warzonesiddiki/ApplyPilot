@@ -1,33 +1,173 @@
-"""ApplyPilot configuration: paths, platform detection, user data."""
+"""ApplyPilot configuration: paths, multi-profile management, platform detection, and filters."""
 
+from __future__ import annotations
+
+import json
 import os
 import platform
 import shutil
 from pathlib import Path
 
-# User data directory — all user-specific files live here
-APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
+import yaml
 
-# Core paths
-DB_PATH = APP_DIR / "applypilot.db"
-PROFILE_PATH = APP_DIR / "profile.json"
-RESUME_PATH = APP_DIR / "resume.txt"
-RESUME_PDF_PATH = APP_DIR / "resume.pdf"
-SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
-ENV_PATH = APP_DIR / ".env"
-
-# Generated output
-TAILORED_DIR = APP_DIR / "tailored_resumes"
-COVER_LETTER_DIR = APP_DIR / "cover_letters"
-LOG_DIR = APP_DIR / "logs"
-
-# Chrome worker isolation
-CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
-APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+# Base application directory — holds shared .env and profiles/ subdirectory
+BASE_APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
+PROFILES_DIR = BASE_APP_DIR / "profiles"
+ACTIVE_PROFILE_FILE = BASE_APP_DIR / "active_profile"
+GLOBAL_ENV_PATH = BASE_APP_DIR / ".env"
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
+
+# Active profile state
+_ACTIVE_PROFILE: str | None = os.environ.get("APPLYPILOT_PROFILE") or None
+
+# Dynamic module-level paths (updated by set_active_profile / _refresh_paths)
+APP_DIR: Path = BASE_APP_DIR
+DB_PATH: Path = APP_DIR / "applypilot.db"
+PROFILE_PATH: Path = APP_DIR / "profile.json"
+RESUME_PATH: Path = APP_DIR / "resume.txt"
+RESUME_PDF_PATH: Path = APP_DIR / "resume.pdf"
+SEARCH_CONFIG_PATH: Path = APP_DIR / "searches.yaml"
+ENV_PATH: Path = APP_DIR / ".env"
+TAILORED_DIR: Path = APP_DIR / "tailored_resumes"
+COVER_LETTER_DIR: Path = APP_DIR / "cover_letters"
+LOG_DIR: Path = APP_DIR / "logs"
+CHROME_WORKER_DIR: Path = APP_DIR / "chrome-workers"
+APPLY_WORKER_DIR: Path = APP_DIR / "apply-workers"
+
+
+def _get_base_dir() -> Path:
+    """Return the base ApplyPilot directory, respecting APPLYPILOT_DIR or BASE_APP_DIR."""
+    if "APPLYPILOT_DIR" in os.environ:
+        return Path(os.environ["APPLYPILOT_DIR"])
+    return BASE_APP_DIR
+
+
+def _resolve_app_dir(profile_name: str | None = None) -> Path:
+    """Resolve the active workspace directory based on profile selection."""
+    base = _get_base_dir()
+    name = profile_name if profile_name is not None else _ACTIVE_PROFILE
+    if not name:
+        env_prof = os.environ.get("APPLYPILOT_PROFILE", "").strip()
+        if env_prof:
+            name = env_prof
+        elif (base / "active_profile").exists():
+            try:
+                saved = (base / "active_profile").read_text(encoding="utf-8").strip()
+                if saved:
+                    name = saved
+            except OSError:
+                pass
+    if name:
+        return base / "profiles" / name
+    return base
+
+
+def _refresh_paths(profile_name: str | None = None) -> Path:
+    """Recompute all module-level path constants for the active profile."""
+    global BASE_APP_DIR, PROFILES_DIR, ACTIVE_PROFILE_FILE, GLOBAL_ENV_PATH
+    global APP_DIR, DB_PATH, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH
+    global SEARCH_CONFIG_PATH, ENV_PATH, TAILORED_DIR, COVER_LETTER_DIR
+    global LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR
+
+    BASE_APP_DIR = _get_base_dir()
+    PROFILES_DIR = BASE_APP_DIR / "profiles"
+    ACTIVE_PROFILE_FILE = BASE_APP_DIR / "active_profile"
+    GLOBAL_ENV_PATH = BASE_APP_DIR / ".env"
+
+    APP_DIR = _resolve_app_dir(profile_name)
+    DB_PATH = APP_DIR / "applypilot.db"
+    PROFILE_PATH = APP_DIR / "profile.json"
+    RESUME_PATH = APP_DIR / "resume.txt"
+    RESUME_PDF_PATH = APP_DIR / "resume.pdf"
+    SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
+    ENV_PATH = APP_DIR / ".env"
+    TAILORED_DIR = APP_DIR / "tailored_resumes"
+    COVER_LETTER_DIR = APP_DIR / "cover_letters"
+    LOG_DIR = APP_DIR / "logs"
+    CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
+    APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+    return APP_DIR
+
+
+def set_active_profile(profile_name: str | None, persist: bool = False) -> Path:
+    """Set the active candidate profile (e.g. 'tahir' or 'neha') and update paths.
+
+    Args:
+        profile_name: Profile slug (or None for root legacy directory).
+        persist: If True, write the profile name to ~/.applypilot/active_profile.
+
+    Returns:
+        Resolved APP_DIR for the profile.
+    """
+    global _ACTIVE_PROFILE
+    clean = profile_name.strip().lower() if profile_name else None
+    _ACTIVE_PROFILE = clean
+    if clean:
+        os.environ["APPLYPILOT_PROFILE"] = clean
+    else:
+        os.environ.pop("APPLYPILOT_PROFILE", None)
+
+    app_dir = _refresh_paths(clean)
+    if persist and clean:
+        BASE_APP_DIR.mkdir(parents=True, exist_ok=True)
+        ACTIVE_PROFILE_FILE.write_text(clean + "\n", encoding="utf-8")
+    return app_dir
+
+
+def get_active_profile() -> str | None:
+    """Return the currently active profile slug, or None if using root."""
+    if _ACTIVE_PROFILE:
+        return _ACTIVE_PROFILE
+    env_prof = os.environ.get("APPLYPILOT_PROFILE", "").strip()
+    if env_prof:
+        return env_prof
+    base = _get_base_dir()
+    af = base / "active_profile"
+    if af.exists():
+        try:
+            return af.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    return None
+
+
+def list_profiles() -> list[dict]:
+    """List all configured candidate profiles and their workspace status."""
+    base = _get_base_dir()
+    pdir = base / "profiles"
+    active = get_active_profile()
+
+    items: list[dict] = [
+        {
+            "name": "default",
+            "active": active is None,
+            "app_dir": str(base),
+            "has_profile": (base / "profile.json").exists(),
+            "has_resume": (base / "resume.txt").exists() or (base / "resume.pdf").exists(),
+            "has_searches": (base / "searches.yaml").exists(),
+        }
+    ]
+    if pdir.exists():
+        for d in sorted(pdir.iterdir()):
+            if d.is_dir() and not d.name.startswith("."):
+                items.append(
+                    {
+                        "name": d.name,
+                        "active": active == d.name,
+                        "app_dir": str(d),
+                        "has_profile": (d / "profile.json").exists(),
+                        "has_resume": (d / "resume.txt").exists() or (d / "resume.pdf").exists(),
+                        "has_searches": (d / "searches.yaml").exists(),
+                    }
+                )
+    return items
+
+
+# Initialize paths on module load
+_refresh_paths()
 
 
 def get_chrome_path() -> str:
@@ -44,7 +184,8 @@ def get_chrome_path() -> str:
     if system == "Windows":
         candidates = [
             Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+            / "Google/Chrome/Application/chrome.exe",
             Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
         ]
     elif system == "Darwin":
@@ -79,47 +220,67 @@ def get_chrome_user_data() -> Path:
     system = platform.system()
     if system == "Windows":
         return Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
-    elif system == "Darwin":
+    if system == "Darwin":
         return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-    else:
-        return Path.home() / ".config" / "google-chrome"
+    return Path.home() / ".config" / "google-chrome"
 
 
-def ensure_dirs():
-    """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+def ensure_dirs() -> None:
+    """Create all required directories for the active profile."""
+    _refresh_paths()
+    for d in [BASE_APP_DIR, APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
+def secure_write_text(path: Path, content: str) -> None:
+    """Write sensitive config/env file and set 0o600 permissions on POSIX."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    if platform.system() != "Windows":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def load_profile() -> dict:
-    """Load user profile from ~/.applypilot/profile.json."""
-    import json
+    """Load user profile from the active profile's profile.json."""
+    _refresh_paths()
     if not PROFILE_PATH.exists():
+        prof = get_active_profile()
+        hint = f"applypilot -p {prof} init" if prof else "applypilot init"
         raise FileNotFoundError(
-            f"Profile not found at {PROFILE_PATH}. Run `applypilot init` first."
+            f"Profile not found at {PROFILE_PATH}. Run `{hint}` first."
         )
     return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
 
 
 def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
-    import yaml
+    """Load search configuration from the active profile's searches.yaml."""
+    _refresh_paths()
     if not SEARCH_CONFIG_PATH.exists():
-        # Fall back to package-shipped example
         example = CONFIG_DIR / "searches.example.yaml"
         if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8"))
+            return yaml.safe_load(example.read_text(encoding="utf-8")) or {}
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
 
 
 def load_sites_config() -> dict:
     """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.)."""
-    import yaml
     path = CONFIG_DIR / "sites.yaml"
     if not path.exists():
         return {}
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def load_employers() -> list[dict]:
+    """Load employers list from bundled employers.yaml."""
+    path = CONFIG_DIR / "employers.yaml"
+    if not path.exists():
+        return []
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("employers", [])
 
 
 def is_manual_ats(url: str | None) -> bool:
@@ -158,6 +319,150 @@ def load_base_urls() -> dict[str, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Unified Location, Title & EU/UK Country Resolution Helpers
+# ---------------------------------------------------------------------------
+
+def load_location_filters(search_cfg: dict | None = None) -> tuple[list[str], list[str]]:
+    """Extract (accept_patterns, reject_patterns) from search config.
+
+    Supports top-level keys (`location_accept` / `location_reject_non_remote`),
+    nested `location` (`accept_patterns` / `reject_patterns`), nested `filters`
+    (`location_accept` / `location_reject`), and falls back to extracting city/country
+    names from the `locations` list when no explicit accept list is provided.
+    """
+    if search_cfg is None:
+        search_cfg = load_search_config()
+
+    loc_block = search_cfg.get("location")
+    filters_block = search_cfg.get("filters")
+    nested_accept = loc_block.get("accept_patterns", []) if isinstance(loc_block, dict) else []
+    nested_reject = loc_block.get("reject_patterns", []) if isinstance(loc_block, dict) else []
+    filter_accept = filters_block.get("location_accept", []) if isinstance(filters_block, dict) else []
+    filter_reject = (
+        filters_block.get("location_reject", []) or filters_block.get("location_reject_non_remote", [])
+        if isinstance(filters_block, dict)
+        else []
+    )
+
+    accept = (
+        list(search_cfg.get("location_accept", []))
+        or list(nested_accept)
+        or list(filter_accept)
+    )
+    if not accept and isinstance(search_cfg.get("locations"), list):
+        derived: list[str] = []
+        for entry in search_cfg["locations"]:
+            loc_str = entry.get("location", "") if isinstance(entry, dict) else str(entry)
+            for part in loc_str.split(","):
+                token = part.strip().lower()
+                if token and token not in derived:
+                    derived.append(token)
+        accept = derived
+
+    reject = (
+        list(search_cfg.get("location_reject_non_remote", []))
+        or list(nested_reject)
+        or list(filter_reject)
+    )
+    return accept, reject
+
+
+def is_location_allowed(
+    location: str | None,
+    accept: list[str] | None = None,
+    reject: list[str] | None = None,
+) -> bool:
+    """Check if a job location passes the user's location filter.
+
+    - Reject patterns are always checked first (even if 'remote' appears in the text,
+      e.g. 'Remote - US Citizen only').
+    - Remote jobs ('remote', 'anywhere', 'wfh', 'work from home', 'distributed',
+      'home-based', 'telecommute', 'emea') are accepted.
+    - If `accept` is empty, all non-rejected locations are accepted (fixes the bug
+      where an unconfigured accept list dropped 100% of non-remote jobs).
+    - If `accept` is non-empty, the location must match at least one accept pattern.
+    """
+    if not location:
+        return True
+
+    loc = location.lower()
+    reject_list = reject or []
+    accept_list = accept or []
+
+    # 1. Explicit reject patterns always win
+    for r in reject_list:
+        if r and r.lower() in loc:
+            return False
+
+    # 2. Remote / pan-regional keywords are always accepted
+    remote_keywords = (
+        "remote", "anywhere", "work from home", "wfh", "distributed",
+        "home-based", "home based", "telecommute", "europe", "emea", "eu-wide",
+    )
+    if any(k in loc for k in remote_keywords):
+        return True
+
+    # 3. If no explicit accept filter is configured, accept all non-rejected locations
+    if not accept_list:
+        return True
+
+    # 4. Otherwise match against accept patterns
+    return any(a and a.lower() in loc for a in accept_list)
+
+
+def is_title_allowed(title: str | None, search_cfg: dict | None = None) -> bool:
+    """Check if a job title passes the exclude_titles filter from searches.yaml."""
+    if not title:
+        return True
+    if search_cfg is None:
+        search_cfg = load_search_config()
+    exclude = search_cfg.get("exclude_titles", [])
+    if not exclude:
+        return True
+    title_lower = title.lower()
+    return not any(ex and ex.lower() in title_lower for ex in exclude)
+
+
+# Mapping of UK & European country/city substrings to JobSpy's `country_indeed` parameter
+_INDEED_COUNTRY_MAP: list[tuple[tuple[str, ...], str]] = [
+    (("united kingdom", "uk", "london", "manchester", "edinburgh", "birmingham", "bristol", "cambridge", "oxford", "leeds", "glasgow", "belfast", "england", "scotland", "wales"), "uk"),
+    (("ireland", "dublin", "cork", "galway", "limerick"), "ireland"),
+    (("netherlands", "amsterdam", "rotterdam", "eindhoven", "utrecht", "the hague", "den haag"), "netherlands"),
+    (("germany", "deutschland", "berlin", "munich", "münchen", "frankfurt", "hamburg", "düsseldorf", "dusseldorf", "stuttgart", "cologne", "köln"), "germany"),
+    (("luxembourg", "luxemburg"), "luxembourg"),
+    (("switzerland", "schweiz", "zurich", "zürich", "geneva", "genève", "basel", "zug", "bern", "lausanne"), "switzerland"),
+    (("france", "paris", "lyon", "toulouse", "marseille", "lille"), "france"),
+    (("spain", "españa", "madrid", "barcelona", "málaga", "malaga", "valencia"), "spain"),
+    (("portugal", "lisbon", "lisboa", "porto"), "portugal"),
+    (("sweden", "stockholm", "gothenburg", "göteborg", "malmö", "malmo"), "sweden"),
+    (("denmark", "copenhagen", "københavn", "aarhus"), "denmark"),
+    (("norway", "oslo", "bergen"), "norway"),
+    (("finland", "helsinki", "espoo", "tampere"), "finland"),
+    (("belgium", "brussels", "bruxelles", "antwerp", "ghent"), "belgium"),
+    (("austria", "österreich", "vienna", "wien", "graz"), "austria"),
+    (("italy", "italia", "milan", "milano", "rome", "roma", "turin"), "italy"),
+    (("poland", "polska", "warsaw", "warszawa", "krakow", "kraków", "wroclaw", "wrocław", "gdansk"), "poland"),
+    (("czech", "prague", "praha", "brno"), "czech republic"),
+    (("romania", "bucharest", "cluj"), "romania"),
+    (("hungary", "budapest"), "hungary"),
+    (("greece", "athens"), "greece"),
+    (("canada", "toronto", "vancouver", "montreal", "ottawa", "calgary"), "canada"),
+    (("united states", "usa", "san francisco", "new york", "seattle", "austin"), "usa"),
+]
+
+
+def infer_country_indeed(location: str | None, default: str = "uk") -> str:
+    """Infer JobSpy's `country_indeed` parameter from a location string."""
+    if not location:
+        return default
+    loc = location.lower()
+    for keywords, country_code in _INDEED_COUNTRY_MAP:
+        if any(k in loc for k in keywords):
+            return country_code
+    return default
+
+
+# ---------------------------------------------------------------------------
 # Default values — referenced across modules instead of magic numbers
 # ---------------------------------------------------------------------------
 
@@ -171,12 +476,15 @@ DEFAULTS = {
 }
 
 
-def load_env():
-    """Load environment variables from ~/.applypilot/.env if it exists."""
+def load_env() -> None:
+    """Load environment variables from profile .env, global ~/.applypilot/.env, and CWD .env."""
     from dotenv import load_dotenv
+
+    _refresh_paths()
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
-    # Also try CWD .env as fallback
+    if GLOBAL_ENV_PATH.exists() and GLOBAL_ENV_PATH != ENV_PATH:
+        load_dotenv(GLOBAL_ENV_PATH)
     load_dotenv()
 
 
@@ -191,7 +499,7 @@ TIER_LABELS = {
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
-    1: ["init", "run discover", "run enrich", "status", "dashboard"],
+    1: ["init", "run discover", "run enrich", "status", "dashboard", "profiles"],
     2: ["run score", "run tailor", "run cover", "run pdf", "run"],
     3: ["apply"],
 }
@@ -258,3 +566,26 @@ def check_tier(required: int, feature: str) -> None:
             _console.print(f"  - {m}")
     _console.print()
     raise SystemExit(1)
+
+
+def is_initialized() -> bool:
+    """Return True if the active profile has profile.json or resume.txt."""
+    _refresh_paths()
+    return PROFILE_PATH.exists() or RESUME_PATH.exists()
+
+
+def require_init() -> None:
+    """Ensure the active profile workspace directories exist."""
+    ensure_dirs()
+
+
+def has_llm_configured() -> bool:
+    """Return True if an LLM API key or local endpoint URL is configured."""
+    load_env()
+    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+
+
+def require_tier(required: int, feature: str = "this command") -> None:
+    """Alias for check_tier()."""
+    check_tier(required, feature)
+

@@ -17,24 +17,32 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
-from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (
-    launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT,
+    _kill_process_tree,
+    cleanup_on_exit,
+    cleanup_worker,
+    kill_all_chrome,
+    launch_chrome,
+    reset_worker_dir,
 )
 from applypilot.apply.dashboard import (
-    init_worker, update_state, add_event, get_state,
-    render_full, get_totals,
+    add_event,
+    get_state,
+    get_totals,
+    init_worker,
+    render_full,
+    update_state,
 )
+from applypilot.database import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +114,12 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
@@ -125,10 +133,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
@@ -157,7 +165,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             logger.info("Skipping manual ATS: %s", row["url"][:80])
             return None
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
                            agent_id = ?,
@@ -177,7 +185,7 @@ def mark_result(url: str, status: str, error: str | None = None,
                 task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -228,7 +236,12 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = prompt_mod.build_prompt(
+        job=job,
+        tailored_resume=resume_text,
+        worker_id=worker_id,
+        redact_secrets=True,
+    )
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -256,7 +269,7 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         reason: Failure reason (only for status='failed').
     """
     conn = get_connection()
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -310,11 +323,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    # Reset per-worker working directory BEFORE staging upload files in build_prompt
+    worker_dir = reset_worker_dir(worker_id)
+
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        worker_id=worker_id,
     )
 
     # Write per-worker MCP config
@@ -347,12 +364,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
-    worker_dir = reset_worker_dir(worker_id)
-
+    company_display = job.get("company") or job.get("site", "")
     update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 company=company_display, score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
-    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
+    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {company_display}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

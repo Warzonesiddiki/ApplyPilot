@@ -26,6 +26,10 @@ __pycache__/
 dist/
 build/
 *.egg
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
 
 # IDE
 .vscode/

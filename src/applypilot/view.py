@@ -10,14 +10,13 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
 import webbrowser
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot import config
 from applypilot.database import get_connection
 
 console = Console()
@@ -32,7 +31,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     Returns:
         Absolute path to the generated HTML file.
     """
-    out = Path(output_path) if output_path else APP_DIR / "dashboard.html"
+    out = Path(output_path) if output_path else config.APP_DIR / "dashboard.html"
 
     conn = get_connection()
 

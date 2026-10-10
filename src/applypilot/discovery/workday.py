@@ -14,7 +14,7 @@ import sqlite3
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 
 import yaml
@@ -42,33 +42,12 @@ def load_employers() -> dict:
 
 def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
-    if search_cfg is None:
-        search_cfg = config.load_search_config()
-
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.load_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-
-    loc = location.lower()
-
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
-    for a in accept:
-        if a.lower() in loc:
-            return True
-
-    return False
+    return config.is_location_allowed(location, accept=accept, reject=reject)
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -302,7 +281,7 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
 
 def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
@@ -326,10 +305,10 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
                 "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), None, short_desc, job.get("location"),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), site, None, short_desc, job.get("location"),
                  site, strategy, now, full_description, url, detail_scraped_at, detail_error),
             )
             new += 1

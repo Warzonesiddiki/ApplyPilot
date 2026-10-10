@@ -52,6 +52,21 @@ base_urls:
   "Himalayas": "https://himalayas.app"
   "Techstars Jobs": "https://www.techstars.com"
   "Randstad Canada": "https://www.randstad.ca/jobs/search/"
+  "Reed UK": "https://www.reed.co.uk"
+  "eFinancialCareers UK": "https://www.efinancialcareers.co.uk"
+  "ICAEW Jobs": "https://jobs.icaew.com"
+  "ACCA Careers": "https://jobs.accaglobal.com"
+  "Totaljobs UK": "https://www.totaljobs.com"
+  "CV-Library UK": "https://www.cv-library.co.uk"
+  "CWJobs UK": "https://www.cwjobs.co.uk"
+  "Relocate.me": "https://relocate.me"
+  "EuroTechJobs": "https://www.eurotechjobs.com"
+  "GermanTechJobs": "https://germantechjobs.de"
+  "SwissDevJobs": "https://swissdevjobs.ch"
+  "DevITjobs UK": "https://devitjobs.uk"
+  "Landing.jobs": "https://landing.jobs"
+  "NoFluffJobs": "https://nofluffjobs.com"
+  "IrishJobs": "https://www.irishjobs.ie"
 
 sites:
   # ── Searchable sites (URL includes query + location params) ──────────
@@ -179,3 +194,64 @@ sites:
   - name: "Otta"
     url: "https://otta.com/jobs/all?title=software+engineer&remote=true"
     type: search
+
+  # ── UK & European Union Job Boards (Tech, AI & ACA / Finance) ──────────
+  - name: "Reed UK"
+    url: "https://www.reed.co.uk/jobs/{query_encoded}-jobs"
+    type: search
+
+  - name: "eFinancialCareers UK"
+    url: "https://www.efinancialcareers.co.uk/search?q={query_encoded}"
+    type: search
+
+  - name: "ICAEW Jobs"
+    url: "https://jobs.icaew.com/searchjobs/?Keywords={query_encoded}"
+    type: search
+
+  - name: "ACCA Careers"
+    url: "https://jobs.accaglobal.com/searchjobs/?Keywords={query_encoded}"
+    type: search
+
+  - name: "Totaljobs UK"
+    url: "https://www.totaljobs.com/jobs/{query_encoded}"
+    type: search
+
+  - name: "CWJobs UK"
+    url: "https://www.cwjobs.co.uk/jobs/{query_encoded}"
+    type: search
+
+  - name: "CV-Library UK"
+    url: "https://www.cv-library.co.uk/{query_encoded}-jobs"
+    type: search
+
+  - name: "IrishJobs"
+    url: "https://www.irishjobs.ie/jobs/{query_encoded}"
+    type: search
+
+  - name: "Relocate.me"
+    url: "https://relocate.me/search?query={query_encoded}"
+    type: search
+
+  - name: "EuroTechJobs"
+    url: "https://www.eurotechjobs.com/job_search/keyword/{query_encoded}"
+    type: search
+
+  - name: "Landing.jobs"
+    url: "https://landing.jobs/jobs?q={query_encoded}"
+    type: search
+
+  - name: "NoFluffJobs"
+    url: "https://nofluffjobs.com/jobs?criteria=keyword%3D{query_encoded}"
+    type: search
+
+  - name: "GermanTechJobs"
+    url: "https://germantechjobs.de/en/jobs"
+    type: static
+
+  - name: "SwissDevJobs"
+    url: "https://swissdevjobs.ch/en/jobs"
+    type: static
+
+  - name: "DevITjobs UK"
+    url: "https://devitjobs.uk/jobs"
+    type: static

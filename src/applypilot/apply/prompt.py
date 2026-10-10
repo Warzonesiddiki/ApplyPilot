@@ -3,7 +3,11 @@
 Constructs the full instruction prompt that tells Claude Code / the AI agent
 how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
+Supports UK & European Union applications, multi-currency compensation,
+visa sponsorship / relocation rules, and both Tech and ACA/Finance domains.
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -12,31 +16,34 @@ from datetime import datetime
 from pathlib import Path
 
 from applypilot import config
+from applypilot.scoring.validator import detect_profile_domain
 
 logger = logging.getLogger(__name__)
 
 
-def _build_profile_summary(profile: dict) -> str:
-    """Format the applicant profile section of the prompt.
+def _format_bool_field(val, default: str = "Yes") -> str:
+    if isinstance(val, bool):
+        return "Yes" if val else "No"
+    return str(val) if val is not None and str(val).strip() else default
 
-    Reads all relevant fields from the profile dict and returns a
-    human-readable multi-line summary for the agent.
-    """
+
+def _build_profile_summary(profile: dict) -> str:
+    """Format the applicant profile section of the prompt."""
     p = profile
-    personal = p["personal"]
-    work_auth = p["work_authorization"]
-    comp = p["compensation"]
+    personal = p.get("personal", {})
+    work_auth = p.get("work_authorization", {})
+    comp = p.get("compensation", {})
     exp = p.get("experience", {})
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
+    resume_facts = p.get("resume_facts", {})
 
     lines = [
-        f"Name: {personal['full_name']}",
-        f"Email: {personal['email']}",
-        f"Phone: {personal['phone']}",
+        f"Name: {personal.get('full_name', '')}",
+        f"Email: {personal.get('email', '')}",
+        f"Phone: {personal.get('phone', '')}",
     ]
 
-    # Address -- handle optional fields gracefully
     addr_parts = [
         personal.get("address", ""),
         personal.get("city", ""),
@@ -44,7 +51,7 @@ def _build_profile_summary(profile: dict) -> str:
         personal.get("country", ""),
         personal.get("postal_code", ""),
     ]
-    lines.append(f"Address: {', '.join(p for p in addr_parts if p)}")
+    lines.append(f"Address: {', '.join(part for part in addr_parts if part)}")
 
     if personal.get("linkedin_url"):
         lines.append(f"LinkedIn: {personal['linkedin_url']}")
@@ -55,37 +62,53 @@ def _build_profile_summary(profile: dict) -> str:
     if personal.get("website_url"):
         lines.append(f"Website: {personal['website_url']}")
 
-    # Work authorization
-    lines.append(f"Work Auth: {work_auth.get('legally_authorized_to_work', 'See profile')}")
-    lines.append(f"Sponsorship Needed: {work_auth.get('require_sponsorship', 'See profile')}")
+    # Work authorization & relocation
+    lines.append(f"Work Auth: {_format_bool_field(work_auth.get('legally_authorized_to_work'), 'See profile')}")
+    lines.append(f"Sponsorship Needed: {_format_bool_field(work_auth.get('require_sponsorship'), 'See profile')}")
+    lines.append(f"Willing to Relocate: {_format_bool_field(work_auth.get('willing_to_relocate'), 'Yes')}")
     if work_auth.get("work_permit_type"):
-        lines.append(f"Work Permit: {work_auth['work_permit_type']}")
+        lines.append(f"Work Permit / Visa Route: {work_auth['work_permit_type']}")
+    if work_auth.get("target_regions"):
+        lines.append(f"Target Regions: {', '.join(work_auth['target_regions'])}")
 
     # Compensation
-    currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    currency = comp.get("salary_currency", "GBP")
+    symbol = {"GBP": "£", "EUR": "€", "USD": "$", "CAD": "$", "CHF": "CHF "}.get(currency.upper(), "")
+    lines.append(f"Salary Expectation: {symbol}{comp.get('salary_expectation', '')} {currency}")
+    if comp.get("currencies") and isinstance(comp["currencies"], dict):
+        curr_parts = []
+        for code, cinfo in comp["currencies"].items():
+            if isinstance(cinfo, dict):
+                sym = cinfo.get("symbol", "")
+                curr_parts.append(f"{code}: {sym}{cinfo.get('expectation', '')} ({sym}{cinfo.get('min', '')}-{sym}{cinfo.get('max', '')})")
+        if curr_parts:
+            lines.append(f"Multi-Currency Expectations: {' | '.join(curr_parts)}")
 
-    # Experience
+    # Experience & Qualifications
     if exp.get("years_of_experience_total"):
         lines.append(f"Years Experience: {exp['years_of_experience_total']}")
     if exp.get("education_level"):
-        lines.append(f"Education: {exp['education_level']}")
+        lines.append(f"Education / Qualification: {exp['education_level']}")
+    certs = resume_facts.get("certifications", [])
+    if certs:
+        lines.append(f"Professional Certifications: {', '.join(str(c) for c in certs)}")
 
-    # Availability
-    lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
+    # Availability & Notice Period
+    lines.append(f"Available / Start Date: {avail.get('earliest_start_date', 'Immediately')}")
+    lines.append(f"Notice Period: {avail.get('notice_period', avail.get('earliest_start_date', 'Immediate / 1 month'))}")
 
     # Standard responses
     lines.extend([
         "Age 18+: Yes",
         "Background Check: Yes",
-        "Felony: No",
+        "Felony / Criminal Record: No",
         "Previously Worked Here: No",
         "How Heard: Online Job Board",
     ])
 
-    # EEO
+    # EEO / UK & EU Diversity
     lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
-    lines.append(f"Race: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
+    lines.append(f"Race / Ethnicity: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
     lines.append(f"Veteran: {eeo.get('veteran_status', 'I am not a protected veteran')}")
     lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
 
@@ -95,116 +118,162 @@ def _build_profile_summary(profile: dict) -> str:
 def _build_location_check(profile: dict, search_config: dict) -> str:
     """Build the location eligibility check section of the prompt.
 
-    Uses the accept_patterns from search config to determine which cities
-    are acceptable for hybrid/onsite roles.
+    Supports UK & Pan-EU target regions as well as relocation-enabled applications.
     """
-    personal = profile["personal"]
-    location_cfg = search_config.get("location", {})
-    accept_patterns = location_cfg.get("accept_patterns", [])
-    primary_city = personal.get("city", location_cfg.get("primary", "your city"))
+    personal = profile.get("personal", {})
+    work_auth = profile.get("work_authorization", {})
+    accept_patterns, reject_patterns = config.load_location_filters(search_config)
 
-    # Build the list of acceptable cities for hybrid/onsite
-    if accept_patterns:
-        city_list = ", ".join(accept_patterns)
-    else:
-        city_list = primary_city
+    target_regions = work_auth.get("target_regions", [])
+    willing_to_relocate = _format_bool_field(work_auth.get("willing_to_relocate"), "Yes").lower() in ("yes", "true", "1")
+
+    eligible_places = list(dict.fromkeys(target_regions + accept_patterns))
+    if not eligible_places:
+        primary_city = personal.get("city", "")
+        primary_country = personal.get("country", "")
+        eligible_places = [p for p in (primary_city, primary_country, "United Kingdom", "European Union", "Europe", "EMEA", "Remote") if p]
+
+    city_list = ", ".join(eligible_places[:35])
+    reject_note = ""
+    if reject_patterns:
+        reject_note = f"\n- Job explicitly requires: {', '.join(reject_patterns)} -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location"
+
+    relocation_rule = (
+        f'- "Hybrid" or "onsite" in ANY target country/city ({city_list}) -> ELIGIBLE (candidate is willing to relocate / work in UK & EU). Apply.'
+        if willing_to_relocate
+        else f'- "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.'
+    )
 
     return f"""== LOCATION CHECK (do this FIRST before any form) ==
-Read the job page. Determine the work arrangement. Then decide:
-- "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
-- "Onsite only" or "hybrid only" in any city outside the list above with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
-- City is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
-- Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
-Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
+Read the job page. Determine the work arrangement and geography. Then decide:
+- "Remote", "work from anywhere", "UK Remote", "EU Remote", or "EMEA Remote" -> ELIGIBLE. Apply.
+{relocation_rule}
+- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK", "relocation provided", or "visa sponsorship available" -> ELIGIBLE. Apply.{reject_note}
+- "Onsite only" in a country outside ({city_list}) with NO remote or relocation option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
+- Cannot determine location -> Continue applying.
+Do NOT abort applications located in the United Kingdom, Ireland, Netherlands, Germany, Luxembourg, Switzerland, or any European Union country — those ARE the target markets!"""
 
 
 def _build_salary_section(profile: dict) -> str:
-    """Build the salary negotiation instructions.
-
-    Adapts floor, range, and currency from the profile's compensation section.
-    """
-    comp = profile["compensation"]
-    currency = comp.get("salary_currency", "USD")
-    floor = comp["salary_expectation"]
-    range_min = comp.get("salary_range_min", floor)
-    range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    """Build multi-currency salary negotiation instructions (GBP, EUR, CHF, USD)."""
+    comp = profile.get("compensation", {})
+    currency = comp.get("salary_currency", "GBP")
+    floor = str(comp.get("salary_expectation", "65000"))
+    range_min = str(comp.get("salary_range_min", floor))
+    range_max = str(comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor))
     conversion_note = comp.get("currency_conversion_note", "")
+    currencies = comp.get("currencies", {})
 
-    # Compute example hourly rates at 3 salary levels
+    symbol = {"GBP": "£", "EUR": "€", "USD": "$", "CAD": "$", "CHF": "CHF "}.get(currency.upper(), "")
+
     try:
         floor_int = int(floor)
         examples = [
-            (f"${floor_int // 1000}K", floor_int // 2080),
-            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
-            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
+            (f"{symbol}{floor_int // 1000}K/yr", f"{symbol}{floor_int // 12:,}/mo", f"{symbol}{floor_int // 220}/day", f"{symbol}{floor_int // 2080}/hr"),
         ]
-        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
+        rate_breakdown = f"({examples[0][0]} = {examples[0][1]} monthly gross = {examples[0][2]} daily rate = {examples[0][3]} hourly)"
     except (ValueError, TypeError):
-        hourly_line = "Divide annual salary by 2080"
+        rate_breakdown = "(Monthly gross = Annual / 12; Daily rate = Annual / 220; Hourly rate = Annual / 2080)"
 
-    # Currency conversion guidance
+    multi_curr_lines = []
+    if isinstance(currencies, dict) and currencies:
+        for code, cinfo in currencies.items():
+            if isinstance(cinfo, dict):
+                sym = cinfo.get("symbol", "")
+                multi_curr_lines.append(
+                    f"  - {code}: target {sym}{cinfo.get('expectation', floor)} (range {sym}{cinfo.get('min', range_min)}-{sym}{cinfo.get('max', range_max)})"
+                )
+    multi_curr_block = "\n".join(multi_curr_lines)
+
     if conversion_note:
-        convert_line = f"Posting is in a different currency? -> {conversion_note}"
+        convert_line = f"Posting/form uses a different currency? -> {conversion_note}"
     else:
-        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
+        convert_line = "Posting/form uses GBP (£), EUR (€), CHF, or USD ($)? -> Match the local currency of the job location."
 
-    return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+    return f"""== SALARY & COMPENSATION (multi-currency UK/EU aware) ==
+Base target: {symbol}{floor} {currency} (range {symbol}{range_min}-{symbol}{range_max} {currency}).
+{f"Currency-specific targets:{chr(10)}{multi_curr_block}" if multi_curr_block else ""}
 
 Decision tree:
-1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
-2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
-3. {convert_line}
-4. No salary info anywhere? -> Use ${floor} {currency}.
-5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
+1. Job posting shows a salary range (e.g. "£65,000-£85,000" or "€70,000-€90,000")? -> Answer with the MIDPOINT in that currency.
+2. {convert_line}
+3. Form asks for ANNUAL GROSS salary? -> Enter the annual figure (digits only if numeric field, e.g. {floor}).
+4. Form asks for MONTHLY GROSS salary (common in Germany, Netherlands, Austria, France, Poland)? -> Divide annual figure by 12. {rate_breakdown}
+5. Form asks for DAILY RATE (common for UK contracts)? -> Divide annual figure by 220.
+6. Form asks for HOURLY RATE? -> Divide annual figure by 2080.
+7. Asked for a range? -> Give "{symbol}{range_min}-{symbol}{range_max} {currency}" (or local currency equivalent)."""
 
 
 def _build_screening_section(profile: dict) -> str:
     """Build the screening questions guidance section."""
-    personal = profile["personal"]
+    personal = profile.get("personal", {})
     exp = profile.get("experience", {})
+    avail = profile.get("availability", {})
+    work_auth = profile.get("work_authorization", {})
+    resume_facts = profile.get("resume_facts", {})
+    domain = detect_profile_domain(profile)
+
     city = personal.get("city", "their city")
+    country = personal.get("country", "")
+    loc_display = f"{city}, {country}".strip(", ")
     years = exp.get("years_of_experience_total", "multiple")
-    target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
-    work_auth = profile["work_authorization"]
+    target_role = exp.get("target_role") or exp.get("current_job_title") or exp.get("current_title") or "professional"
+    willing_relocate = _format_bool_field(work_auth.get("willing_to_relocate"), "Yes")
+    require_sponsorship = _format_bool_field(work_auth.get("require_sponsorship"), "No")
+    permit_type = work_auth.get("work_permit_type", "")
+    notice_period = avail.get("notice_period", avail.get("earliest_start_date", "Immediate / 1 month"))
+    certs = ", ".join(str(c) for c in resume_facts.get("certifications", []))
+
+    if domain == "finance_accounting":
+        domain_confidence = (
+            f"Skills, accounting standards, and tools -> be confident. This candidate is a qualified {target_role} "
+            f"({certs or exp.get('education_level', 'ACA')}) with {years} years experience. "
+            "If the question asks 'Do you have experience with [IFRS / UK GAAP / FRS 102 / ISA / SOX / SAP / NetSuite / FP&A]?' "
+            "and it is within accounting, audit, financial reporting, or corporate finance, answer YES."
+        )
+    else:
+        domain_confidence = (
+            f"Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. "
+            "If the question asks 'Do you have experience with [tool]?' and it's in the same domain "
+            "(AI, backend, full-stack, FP&A systems, cloud, automation, data), answer YES. Engineers learn tools fast. Don't sell short."
+        )
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
-  - Citizenship, clearance, licenses, certifications: answer from profile only
-  - Criminal/background: answer from profile only
+  - Current location & relocation: based in {loc_display}; willing to relocate to UK/EU: {willing_relocate}
+  - Work authorization: {_format_bool_field(work_auth.get('legally_authorized_to_work'), 'see profile')}
+  - Visa sponsorship required: {require_sponsorship}{f' ({permit_type})' if permit_type else ''}
+  - Notice period / earliest start date: {notice_period}
+  - Professional qualifications / certifications: {certs or exp.get('education_level', 'see profile')}
+  - Criminal/background check: No criminal record, happy to complete background check
 
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
+{domain_confidence}
 
-Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
+Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real professional.
 
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+UK/EU GDPR & Privacy Consent checkboxes ("I consent to the processing of my personal data for recruitment purposes") -> ALWAYS check/accept (required by EU/UK law to submit an application).
+EEO/diversity monitoring -> "Decline to self-identify" or "Prefer not to say" for everything."""
 
 
 def _build_hard_rules(profile: dict) -> str:
     """Build the hard rules section with work auth and name from profile."""
-    personal = profile["personal"]
-    work_auth = profile["work_authorization"]
+    personal = profile.get("personal", {})
+    work_auth = profile.get("work_authorization", {})
 
-    full_name = personal["full_name"]
-    preferred_name = personal.get("preferred_name", full_name.split()[0])
-    preferred_last = full_name.split()[-1] if " " in full_name else ""
+    full_name = personal.get("full_name", "Candidate")
+    clean_parts = full_name.split(",")[0].strip().split()
+    preferred_name = personal.get("preferred_name") or (clean_parts[0] if clean_parts else full_name)
+    preferred_last = clean_parts[-1] if len(clean_parts) > 1 else ""
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
-    # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
-    sponsorship = work_auth.get("require_sponsorship", "")
+    sponsorship = _format_bool_field(work_auth.get("require_sponsorship"), "No")
     permit_type = work_auth.get("work_permit_type", "")
 
-    work_auth_rule = "Work auth: Answer truthfully from profile."
+    work_auth_rule = f"Work auth & sponsorship: Sponsorship needed = {sponsorship}."
     if permit_type:
         work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
 
-    name_rule = f'Name: Legal name = {full_name}.'
+    name_rule = f"Name: Legal name = {full_name}."
     if preferred_name and preferred_name != full_name.split()[0]:
         name_rule += f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
 
@@ -214,14 +283,12 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_captcha_section() -> str:
-    """Build the CAPTCHA detection and solving instructions.
-
-    Reads the CapSolver API key from environment. The CAPTCHA section
-    contains no personal data -- it's the same for every user.
-    """
+def _build_captcha_section(redact_secrets: bool = False) -> str:
+    """Build the CAPTCHA detection and solving instructions."""
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    if redact_secrets and capsolver_key:
+        capsolver_key = "<REDACTED_CAPSOLVER_API_KEY>"
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
@@ -417,24 +484,15 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
-def build_prompt(job: dict, tailored_resume: str,
-                 cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
-    """Build the full instruction prompt for the apply agent.
-
-    Loads the user profile and search config internally. All personal data
-    comes from the profile -- nothing is hardcoded.
-
-    Args:
-        job: Job dict from the database (must have url, title, site,
-             application_url, fit_score, tailored_resume_path).
-        tailored_resume: Plain-text content of the tailored resume.
-        cover_letter: Optional plain-text cover letter content.
-        dry_run: If True, tell the agent not to click Submit.
-
-    Returns:
-        Complete prompt string for the AI agent.
-    """
+def build_prompt(
+    job: dict,
+    tailored_resume: str,
+    cover_letter: str | None = None,
+    dry_run: bool = False,
+    worker_id: int = 0,
+    redact_secrets: bool = False,
+) -> str:
+    """Build the full instruction prompt for the apply agent."""
     profile = config.load_profile()
     search_config = config.load_search_config()
     personal = profile["personal"]
@@ -448,10 +506,10 @@ def build_prompt(job: dict, tailored_resume: str,
     if not src_pdf.exists():
         raise ValueError(f"Resume PDF not found: {src_pdf}")
 
-    # Copy to a clean filename for upload (recruiters see the filename)
+    # Copy to a clean, per-worker isolated directory for upload
     full_name = personal["full_name"]
-    name_slug = full_name.replace(" ", "_")
-    dest_dir = config.APPLY_WORKER_DIR / "current"
+    name_slug = full_name.split(",")[0].strip().replace(" ", "_")
+    dest_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}" / "uploads"
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
     shutil.copy(str(src_pdf), str(upload_pdf))
@@ -463,13 +521,11 @@ def build_prompt(job: dict, tailored_resume: str,
     cl_path = job.get("cover_letter_path")
     if cl_path and Path(cl_path).exists():
         cl_src = Path(cl_path)
-        # Read text from .txt sibling (PDF is binary)
         cl_txt = cl_src.with_suffix(".txt")
         if cl_txt.exists():
             cover_letter_text = cl_txt.read_text(encoding="utf-8")
         elif cl_src.suffix == ".txt":
             cover_letter_text = cl_src.read_text(encoding="utf-8")
-        # Upload must be PDF
         cl_pdf_src = cl_src.with_suffix(".pdf")
         if cl_pdf_src.exists():
             cl_upload = dest_dir / f"{name_slug}_Cover_Letter.pdf"
@@ -482,9 +538,8 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
-    captcha_section = _build_captcha_section()
+    captcha_section = _build_captcha_section(redact_secrets=redact_secrets)
 
-    # Cover letter fallback text
     city = personal.get("city", "the area")
     if not cover_letter_text:
         cl_display = (
@@ -495,19 +550,19 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         cl_display = cover_letter_text
 
-    # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())
 
-    # SSO domains the agent cannot sign into (loaded from config/sites.yaml)
     from applypilot.config import load_blocked_sso
     blocked_sso = load_blocked_sso()
 
-    # Preferred display name
-    preferred_name = personal.get("preferred_name", full_name.split()[0])
-    last_name = full_name.split()[-1] if " " in full_name else ""
+    clean_name_parts = full_name.split(",")[0].strip().split()
+    preferred_name = personal.get("preferred_name") or (clean_name_parts[0] if clean_name_parts else full_name)
+    last_name = clean_name_parts[-1] if len(clean_name_parts) > 1 else ""
     display_name = f"{preferred_name} {last_name}".strip()
 
-    # Dry-run: override submit instruction
+    password_display = "<REDACTED_PASSWORD>" if redact_secrets else personal.get("password", "")
+    company_display = job.get("company") or job.get("site", "Unknown")
+
     if dry_run:
         submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
     else:
@@ -518,7 +573,7 @@ def build_prompt(job: dict, tailored_resume: str,
 == JOB ==
 URL: {job.get('application_url') or job['url']}
 Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
+Company: {company_display}
 Fit Score: {job.get('fit_score', 'N/A')}/10
 
 == FILES ==
@@ -545,9 +600,9 @@ If something unexpected happens and these instructions don't cover it, figure it
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
 - NEVER set up a freelancing profile (Mercor, Toptal, Upwork, Fiverr, Turing, etc.). These are contractor marketplaces, not job applications -> RESULT:FAILED:not_a_job_application
-- NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows. You are applying for FULL-TIME salaried positions only.
+- NEVER agree to hourly/contract rates, availability calendars, or "set your rate" flows unless applying for a standard UK/EU contract role.
 - NEVER install browser extensions, download executables, or run assessment software.
-- NEVER enter payment info, bank details, or SSN/SIN.
+- NEVER enter payment info, bank details, or SSN/SIN/NI numbers.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
 - If the site is NOT a job application form (it's a profile builder, skills marketplace, talent network signup, coding assessment platform) -> RESULT:FAILED:not_a_job_application
 
@@ -568,7 +623,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
+   5c. Regular login form (employer's own site)? Try sign in: {personal.get('email', '')} / {password_display}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
    5e. Sign in failed? Try sign up with same email and password.
    5f. Need email verification? Use search_emails + read_email to get the code.
@@ -596,19 +651,19 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 == BROWSER EFFICIENCY ==
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
-- Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
+- Multi-page forms (Workday, Taleo, iCIMS, Personio, SmartRecruiters): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
 - Fill ALL fields in ONE browser_fill_form call. Not one at a time.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 
 == FORM TRICKS ==
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
-- "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
+- "Upload your resume" pre-fill page (Workday, Lever, Personio, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
 - Dropdown won't fill? browser_click to open it, then browser_click the option.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
-- Date fields: {datetime.now().strftime('%m/%d/%Y')}
+- Date fields (UK/EU DD/MM/YYYY format): {datetime.now().strftime('%d/%m/%Y')} (or ISO {datetime.now().strftime('%Y-%m-%d')} if requested)
 - Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.

@@ -24,7 +24,7 @@ import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import close_connection, get_connection, init_db
+from applypilot.database import close_connection, init_db
 from applypilot.network import RetryPolicy, build_async_client, request_bounded_json
 
 log = logging.getLogger(__name__)
@@ -600,46 +600,6 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict[str, Any]], employer
 
     conn.commit()
     return new, existing
-
-
-def _process_one(
-    employer_key: str,
-    employers: dict[str, Any],
-    search_text: str,
-    location_filter: bool,
-    accept_locs: list[str],
-    reject_locs: list[str],
-) -> dict[str, Any]:
-    """Search one employer, fetch details, store results."""
-    emp = employers[employer_key]
-
-    try:
-        jobs = search_employer(
-            employer_key, emp, search_text,
-            location_filter=location_filter,
-            accept_locs=accept_locs,
-            reject_locs=reject_locs,
-        )
-    except Exception as e:
-        log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
-        return {"employer": emp["name"], "query": search_text,
-                "found": 0, "new": 0, "existing": 0, "error": str(e)}
-
-    if not jobs:
-        return {"employer": emp["name"], "query": search_text,
-                "found": 0, "new": 0, "existing": 0}
-
-    try:
-        jobs = fetch_details(emp, jobs)
-    except Exception as e:
-        log.error("%s: ERROR fetching details for '%s': %s", emp["name"], search_text, e)
-
-    conn = get_connection()
-    new, existing = store_results(conn, jobs, employers)
-    log.info("%s: %d new, %d already in DB", emp["name"], new, existing)
-
-    return {"employer": emp["name"], "query": search_text,
-            "found": len(jobs), "new": new, "existing": existing}
 
 
 # -- Public sync/async orchestrators ------------------------------------------

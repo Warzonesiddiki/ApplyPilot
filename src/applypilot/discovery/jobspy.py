@@ -105,6 +105,10 @@ def store_jobspy_results(
     search_cfg: dict | None = None,
 ) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
+    from applypilot.database import compute_job_fingerprint, ensure_columns
+    from applypilot.enrichment.sponsors import detect_sponsor_status, detect_work_arrangement
+
+    ensure_columns(conn)
     now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
@@ -159,16 +163,20 @@ def store_jobspy_results(
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        comp_val = company or site_label
+        fp = compute_job_fingerprint(comp_val, title, location_str)
+        sponsor = detect_sponsor_status(comp_val, title, full_description or description, location_str)
+        work_arr = detect_work_arrangement(title, location_str, full_description or description)
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "full_description, application_url, detail_scraped_at, fingerprint, sponsor_status, work_arrangement, crm_stage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     url,
                     title,
-                    company or site_label,
+                    comp_val,
                     salary,
                     description,
                     location_str,
@@ -178,6 +186,10 @@ def store_jobspy_results(
                     full_description,
                     apply_url,
                     detail_scraped_at,
+                    fp,
+                    sponsor,
+                    work_arr,
+                    "discovered",
                 ),
             )
             new += 1

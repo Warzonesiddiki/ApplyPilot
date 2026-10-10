@@ -161,23 +161,38 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 ## CLI Reference
 
 ```
-applypilot init                         # First-time setup wizard
-applypilot doctor                       # Verify setup, diagnose missing requirements
-applypilot run [stages...]              # Run pipeline stages (or 'all')
-applypilot run --workers 4              # Parallel discovery/enrichment
-applypilot run --stream                 # Concurrent stages (streaming mode)
-applypilot run --min-score 8            # Override score threshold
-applypilot run --dry-run                # Preview without executing
-applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
-applypilot run --validation strict      # Strictest validation (retries on any banned word)
-applypilot apply                        # Launch auto-apply
-applypilot apply --workers 3            # Parallel browser workers
-applypilot apply --dry-run              # Fill forms without submitting
-applypilot apply --continuous           # Run forever, polling for new jobs
-applypilot apply --headless             # Headless browser mode
-applypilot apply --url URL              # Apply to a specific job
-applypilot status                       # Pipeline statistics
-applypilot dashboard                    # Open HTML results dashboard
+applypilot init                              # First-time setup wizard
+applypilot init -p tahir -t tahir            # Bootstrap Tahir Siddique's UK/EU profile
+applypilot init -p neha -t neha              # Bootstrap Neha Tariq, ACA's UK/EU profile
+applypilot init --from-resume path/to/cv.txt # Auto-generate profile & searches from an existing CV
+applypilot profiles                          # List all configured candidate profiles
+applypilot doctor                            # Verify setup, diagnose missing requirements
+applypilot run [stages...]                   # Run pipeline stages (or 'all')
+applypilot run --workers 4                   # Parallel discovery/enrichment (JobSpy + Workday + Direct ATS + SmartExtract)
+applypilot run --all-profiles                # Run pipeline across all initialized candidate profiles
+applypilot run --stream                      # Concurrent stages (streaming mode)
+applypilot run --min-score 8                 # Override score threshold
+applypilot run --dry-run                     # Preview without executing
+applypilot run --validation lenient          # Relax validation (recommended for Gemini free tier)
+applypilot run --validation strict           # Strictest validation (retries on any banned word)
+applypilot dedup                             # Cross-board fuzzy deduplication & direct-ATS prioritization
+applypilot apply                             # Launch auto-apply
+applypilot apply --workers 3                 # Parallel browser workers
+applypilot apply --dry-run                   # Fill forms without submitting
+applypilot apply --engine native             # Native Python application proof-packet engine (no Claude CLI required)
+applypilot apply --retry-transient           # Smart retry: reset only transient/timeout failures
+applypilot apply --continuous                # Run forever, polling for new jobs
+applypilot apply --headless                  # Headless browser mode
+applypilot apply --url URL                   # Apply to a specific job
+applypilot sync-email                        # Sync recruiting emails (OA, interview, offer, rejection) into CRM stages
+applypilot memory                            # View or update canonical screening Q&A memory bank
+applypilot prep [URL_OR_QUERY]               # Generate tailored Interview Prep Dossier (STAR answers)
+applypilot outreach [URL_OR_QUERY]           # Generate LinkedIn (<300 chars), InMail & Cold Email outreach
+applypilot export --format csv               # Export pipeline jobs to CSV, JSON, or Markdown
+applypilot status                            # Pipeline statistics, ATS coverage & UK/EU sponsor counts
+applypilot status --all-profiles             # Side-by-side status table across all profiles
+applypilot dashboard                         # Generate and open HTML Career CRM dashboard
+applypilot serve --port 8080                 # Launch interactive Career CRM web application server
 ```
 
 ---

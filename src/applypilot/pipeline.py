@@ -33,14 +33,16 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
+ALL_STAGES = STAGE_ORDER
+AI_STAGES = ("score", "tailor", "cover")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
-    "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
-    "score":    {"desc": "LLM scoring (fit 1-10)"},
-    "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
-    "cover":    {"desc": "Cover letter generation"},
-    "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
+    "discover": {"desc": "Job discovery (JobSpy + Workday + Direct ATS + SmartExtract)"},
+    "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs + sponsor check)"},
+    "score":    {"desc": "Explainable 4D LLM scoring + ATS keyword analysis"},
+    "tailor":   {"desc": "Resume tailoring (LLM + validation + ATS coverage + DOCX/PDF)"},
+    "cover":    {"desc": "Cover letter generation (TXT + DOCX + PDF)"},
+    "pdf":      {"desc": "PDF & DOCX conversion (tailored resumes + cover letters)"},
 }
 
 # Upstream dependency: a stage only finishes when its upstream is done AND
@@ -59,84 +61,119 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover(workers: int = 1) -> dict:
-    """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+def _run_discover(
+    workers: int = 1,
+    sources: list[str] | None = None,
+    deduplicate: bool = True,
+) -> dict:
+    """Stage: Job discovery — JobSpy, Workday, Direct ATS, and smart-extract scrapers."""
+    active_sources = [s.lower() for s in (sources or ["jobspy", "workday", "ats", "smartextract"])]
+    stats: dict = {"jobspy": None, "workday": None, "ats": None, "smartextract": None}
 
-    # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+    if "jobspy" in active_sources:
+        console.print("  [cyan]JobSpy full crawl...[/cyan]")
+        try:
+            from applypilot.discovery.jobspy import run_discovery
+            run_discovery()
+            stats["jobspy"] = "ok"
+        except Exception as e:
+            log.error("JobSpy crawl failed: %s", e)
+            console.print(f"  [red]JobSpy error:[/red] {e}")
+            stats["jobspy"] = f"error: {e}"
 
-    # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
+    if "workday" in active_sources:
+        console.print("  [cyan]Workday corporate scraper...[/cyan]")
+        try:
+            from applypilot.discovery.workday import run_workday_discovery
+            run_workday_discovery(workers=workers)
+            stats["workday"] = "ok"
+        except Exception as e:
+            log.error("Workday scraper failed: %s", e)
+            console.print(f"  [red]Workday error:[/red] {e}")
+            stats["workday"] = f"error: {e}"
 
-    # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+    if "ats" in active_sources:
+        console.print("  [cyan]Direct ATS API scraper (Greenhouse, Lever, Ashby, SmartRecruiters)...[/cyan]")
+        try:
+            from applypilot.discovery.ats_direct import run_ats_direct_discovery
+            run_ats_direct_discovery(workers=max(1, workers))
+            stats["ats"] = "ok"
+        except Exception as e:
+            log.error("Direct ATS scraper failed: %s", e)
+            console.print(f"  [red]Direct ATS error:[/red] {e}")
+            stats["ats"] = f"error: {e}"
+
+    if "smartextract" in active_sources:
+        console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
+        try:
+            from applypilot.discovery.smartextract import run_smart_extract
+            run_smart_extract(workers=workers)
+            stats["smartextract"] = "ok"
+        except Exception as e:
+            log.error("Smart extract failed: %s", e)
+            console.print(f"  [red]Smart extract error:[/red] {e}")
+            stats["smartextract"] = f"error: {e}"
+
+    if deduplicate:
+        try:
+            from applypilot.database import deduplicate_jobs
+            dedup = deduplicate_jobs()
+            if dedup["duplicates_removed"] > 0:
+                console.print(
+                    f"  [green]Cross-board deduplication merged {dedup['duplicates_removed']} duplicate listings.[/green]"
+                )
+        except Exception as e:
+            log.debug("Deduplication skipped: %s", e)
 
     return stats
 
 
-def _run_enrich(workers: int = 1) -> dict:
+def _run_enrich(workers: int = 1, limit: int = 0) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment(workers=workers)
+        run_enrichment(limit=limit if limit > 0 else 100, workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_score() -> dict:
+def _run_score(limit: int = 0, workers: int = 1) -> dict:
     """Stage: LLM scoring — assign fit scores 1-10."""
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring()
+        run_scoring(limit=limit, workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_tailor(min_score: int = 7, validation_mode: str = "normal", limit: int = 0) -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        run_tailoring(
+            min_score=min_score,
+            limit=limit if limit > 0 else 20,
+            validation_mode=validation_mode,
+        )
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
+def _run_cover(min_score: int = 7, validation_mode: str = "normal", limit: int = 0) -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
+        run_cover_letters(
+            min_score=min_score,
+            limit=limit if limit > 0 else 20,
+            validation_mode=validation_mode,
+        )
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
@@ -144,7 +181,13 @@ def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
 
 
 def _run_pdf() -> dict:
-    """Stage: PDF conversion — convert tailored resumes and cover letters to PDF."""
+    """Stage: PDF & DOCX conversion — convert tailored resumes and cover letters."""
+    try:
+        from applypilot.scoring.docx_export import batch_convert_docx
+        batch_convert_docx()
+    except Exception as e:
+        log.debug("DOCX conversion warning: %s", e)
+
     try:
         from applypilot.scoring.pdf import batch_convert
         batch_convert()
@@ -274,7 +317,7 @@ def _run_stage_streaming(
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["validation_mode"] = validation_mode
-    if stage in ("discover", "enrich"):
+    if stage in ("discover", "enrich", "score"):
         kwargs["workers"] = workers
 
     upstream = _UPSTREAM[stage]
@@ -323,9 +366,16 @@ def _run_stage_streaming(
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
-                    validation_mode: str = "normal") -> dict:
-    """Execute stages one at a time (original behavior)."""
+def _run_sequential(
+    ordered: list[str],
+    min_score: int,
+    workers: int = 1,
+    validation_mode: str = "normal",
+    sources: list[str] | None = None,
+    limit: int = 0,
+    deduplicate: bool = True,
+) -> dict:
+    """Execute stages one at a time."""
     results: list[dict] = []
     errors: dict[str, str] = {}
     pipeline_start = time.time()
@@ -342,11 +392,20 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
 
         try:
             kwargs: dict = {}
-            if name in ("tailor", "cover"):
+            if name == "discover":
+                kwargs["workers"] = workers
+                kwargs["sources"] = sources
+                kwargs["deduplicate"] = deduplicate
+            elif name == "enrich":
+                kwargs["workers"] = workers
+                kwargs["limit"] = limit
+            elif name == "score":
+                kwargs["limit"] = limit
+                kwargs["workers"] = workers
+            elif name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["validation_mode"] = validation_mode
-            if name in ("discover", "enrich"):
-                kwargs["workers"] = workers
+                kwargs["limit"] = limit
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -443,33 +502,66 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
 
 def run_pipeline(
     stages: list[str] | None = None,
+    sources: list[str] | None = None,
     min_score: int = 7,
+    limit: int = 0,
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
+    batch_size: int = 5,
     validation_mode: str = "normal",
+    validation: str | None = None,
+    skip_enrich: bool = False,
+    skip_tailor: bool = False,
+    skip_cover: bool = False,
+    skip_pdf: bool = False,
+    deduplicate: bool = True,
 ) -> dict:
     """Run pipeline stages.
 
     Args:
         stages: List of stage names, or None / ["all"] for full pipeline.
+        sources: Discovery sources ('jobspy', 'workday', 'ats', 'smartextract').
         min_score: Minimum fit score for tailor/cover stages.
+        limit: Max jobs per stage (0 = default/no limit).
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
+        batch_size: Items per stage cycle in stream mode.
+        validation_mode: Validation mode ('strict', 'normal', 'lenient').
+        validation: Alias for validation_mode.
+        skip_enrich: Skip enrich stage.
+        skip_tailor: Skip tailor stage.
+        skip_cover: Skip cover stage.
+        skip_pdf: Skip pdf stage.
+        deduplicate: Run cross-board deduplication after discovery.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
     """
+    val_mode = validation or validation_mode
+
     # Bootstrap
     load_env()
     ensure_dirs()
     init_db()
 
     # Resolve stages
-    if stages is None:
+    if stages is None or not stages:
         stages = ["all"]
     ordered = _resolve_stages(stages)
+
+    skip_set: set[str] = set()
+    if skip_enrich:
+        skip_set.add("enrich")
+    if skip_tailor:
+        skip_set.add("tailor")
+    if skip_cover:
+        skip_set.add("cover")
+    if skip_pdf:
+        skip_set.add("pdf")
+    if skip_set:
+        ordered = [s for s in ordered if s not in skip_set]
 
     # Banner
     mode = "streaming" if stream else "sequential"
@@ -480,7 +572,7 @@ def run_pipeline(
     ))
     console.print(f"  Min score:  {min_score}")
     console.print(f"  Workers:    {workers}")
-    console.print(f"  Validation: {validation_mode}")
+    console.print(f"  Validation: {val_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")
 
     # Pre-run stats
@@ -498,10 +590,17 @@ def run_pipeline(
     # Execute
     if stream:
         result = _run_streaming(ordered, min_score, workers=workers,
-                                validation_mode=validation_mode)
+                                validation_mode=val_mode)
     else:
-        result = _run_sequential(ordered, min_score, workers=workers,
-                                 validation_mode=validation_mode)
+        result = _run_sequential(
+            ordered,
+            min_score,
+            workers=workers,
+            validation_mode=val_mode,
+            sources=sources,
+            limit=limit,
+            deduplicate=deduplicate,
+        )
 
     # Summary table
     console.print(f"\n{'=' * 70}")
@@ -535,6 +634,27 @@ def run_pipeline(
     console.print(f"    Cover letters:  {final['with_cover_letter']}")
     console.print(f"    Ready to apply: {final['ready_to_apply']}")
     console.print(f"    Applied:        {final['applied']}")
+    console.print(f"    UK/EU Sponsors: {final.get('verified_sponsors', 0)}")
+    console.print(f"    Avg ATS Match:  {final.get('avg_ats_coverage', 0.0)}%")
+
+    try:
+        from applypilot.llm import get_telemetry
+        tel = get_telemetry()
+        if tel["calls"] > 0:
+            console.print(
+                f"    LLM Telemetry:  {tel['calls']} calls | "
+                f"~{tel['prompt_tokens_est'] + tel['completion_tokens_est']:,} tokens | "
+                f"est. ${tel['estimated_cost_usd']:.4f} | failovers={tel['failovers']}"
+            )
+    except Exception:
+        pass
+
     console.print(f"{'=' * 70}\n")
+
+    try:
+        from applypilot.notifications import notify_pipeline_summary
+        notify_pipeline_summary(final)
+    except Exception:
+        pass
 
     return result

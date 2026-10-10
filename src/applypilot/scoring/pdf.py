@@ -136,18 +136,27 @@ def parse_entries(text: str) -> list[dict]:
 
 # ── HTML Templates (Resume & Cover Letter) ───────────────────────────────
 
-def build_html(resume: dict) -> str:
-    """Build professional resume HTML from parsed data with full HTML escaping."""
+def build_html(resume: dict, theme: str = "modern") -> str:
+    """Build professional resume HTML from parsed data with full HTML escaping and theme support.
+
+    Supported themes:
+      - 'modern': Crisp Calibri/Segoe UI layout (default).
+      - 'executive_uk_eu': A4 executive typography tailored for UK/EU Chartered Accountancy (ACA/ACCA) & Senior Finance.
+      - 'compact_ats': Dense single-page ATS layout.
+    """
     sections = resume["sections"]
 
     # Skills
     skills_html = ""
-    if "TECHNICAL SKILLS" in sections:
-        skills = parse_skills(sections["TECHNICAL SKILLS"])
-        rows = ""
-        for cat, val in skills:
-            rows += f'<div class="skill-row"><span class="skill-cat">{escape(cat)}:</span> {escape(val)}</div>\n'
-        skills_html = f'<div class="section"><div class="section-title">Technical Skills</div>{rows}</div>'
+    for sk_header in ("TECHNICAL SKILLS", "CORE COMPETENCIES & TECHNICAL SKILLS", "CORE COMPETENCIES", "SKILLS"):
+        if sk_header in sections and sections[sk_header].strip():
+            skills = parse_skills(sections[sk_header])
+            rows = ""
+            for cat, val in skills:
+                rows += f'<div class="skill-row"><span class="skill-cat">{escape(cat)}:</span> {escape(val)}</div>\n'
+            sec_title = "Core Competencies &amp; Technical Skills" if "COMPETENCIES" in sk_header else "Technical Skills"
+            skills_html = f'<div class="section"><div class="section-title">{sec_title}</div>{rows}</div>'
+            break
 
     # Experience
     exp_html = ""
@@ -197,14 +206,40 @@ def build_html(resume: dict) -> str:
 
     location_html = f'<div class="location">{escape(resume["location"])}</div>' if resume["location"] else ""
 
+    clean_theme = (theme or "modern").strip().lower()
+    if clean_theme == "executive_uk_eu":
+        page_size = "A4"
+        page_margin = "12mm 15mm"
+        font_family = "'Georgia', 'Cambria', 'Times New Roman', serif"
+        base_size = "10pt"
+        line_height = "1.38"
+        accent_color = "#0f172a"
+        border_color = "#1e3a8a"
+    elif clean_theme == "compact_ats":
+        page_size = "letter"
+        page_margin = "0.28in 0.4in"
+        font_family = "'Calibri', 'Segoe UI', Arial, sans-serif"
+        base_size = "8.6pt"
+        line_height = "1.2"
+        accent_color = "#1a3a5c"
+        border_color = "#2a7ab5"
+    else:
+        page_size = "letter"
+        page_margin = "0.35in 0.5in"
+        font_family = "'Calibri', 'Segoe UI', Arial, sans-serif"
+        base_size = "10pt"
+        line_height = "1.35"
+        accent_color = "#1a3a5c"
+        border_color = "#2a7ab5"
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
 @page {{
-    size: letter;
-    margin: 0.35in 0.5in;
+    size: {page_size};
+    margin: {page_margin};
 }}
 * {{
     margin: 0;
@@ -212,21 +247,21 @@ def build_html(resume: dict) -> str:
     box-sizing: border-box;
 }}
 body {{
-    font-family: 'Calibri', 'Segoe UI', Arial, sans-serif;
-    font-size: 10pt;
-    line-height: 1.35;
+    font-family: {font_family};
+    font-size: {base_size};
+    line-height: {line_height};
     color: #1a1a1a;
 }}
 .header {{
     text-align: center;
     margin-bottom: 4px;
     padding-bottom: 4px;
-    border-bottom: 1.5px solid #2a7ab5;
+    border-bottom: 1.5px solid {border_color};
 }}
 .name {{
     font-size: 18pt;
     font-weight: 700;
-    color: #1a3a5c;
+    color: {accent_color};
     letter-spacing: 0.5px;
 }}
 .title {{
@@ -253,10 +288,10 @@ body {{
 .section-title {{
     font-size: 10pt;
     font-weight: 700;
-    color: #1a3a5c;
+    color: {accent_color};
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    border-bottom: 1.5px solid #2a7ab5;
+    border-bottom: 1.5px solid {border_color};
     padding-bottom: 1px;
     margin-bottom: 3px;
 }}
@@ -460,16 +495,25 @@ def convert_to_pdf(
     output_path: Path | None = None,
     html_only: bool = False,
     page=None,
+    theme: str | None = None,
 ) -> Path:
     """Convert a text resume or cover letter to PDF (or HTML)."""
     text_path = Path(text_path)
     text = text_path.read_text(encoding="utf-8")
 
+    resolved_theme = theme
+    if not resolved_theme:
+        try:
+            prof = config.load_profile()
+            resolved_theme = str(prof.get("pdf_theme") or "modern")
+        except Exception:
+            resolved_theme = "modern"
+
     if is_cover_letter(text, text_path):
         html = build_cover_letter_html(text)
     else:
         resume = parse_resume(text)
-        html = build_html(resume)
+        html = build_html(resume, theme=resolved_theme)
 
     if html_only:
         out = output_path or text_path.with_suffix(".html")

@@ -33,9 +33,22 @@ SEARCH_CONFIG_PATH: Path = APP_DIR / "searches.yaml"
 ENV_PATH: Path = APP_DIR / ".env"
 TAILORED_DIR: Path = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR: Path = APP_DIR / "cover_letters"
+PREP_DIR: Path = APP_DIR / "interview_prep"
+OUTREACH_DIR: Path = APP_DIR / "outreach"
+PROOFS_DIR: Path = APP_DIR / "proofs"
 LOG_DIR: Path = APP_DIR / "logs"
 CHROME_WORKER_DIR: Path = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR: Path = APP_DIR / "apply-workers"
+
+LLM_ENV_KEYS: tuple[str, ...] = (
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GROQ_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "LLM_URL",
+)
 
 
 def _get_base_dir() -> Path:
@@ -70,6 +83,7 @@ def _refresh_paths(profile_name: str | None = None) -> Path:
     global BASE_APP_DIR, PROFILES_DIR, ACTIVE_PROFILE_FILE, GLOBAL_ENV_PATH
     global APP_DIR, DB_PATH, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH
     global SEARCH_CONFIG_PATH, ENV_PATH, TAILORED_DIR, COVER_LETTER_DIR
+    global PREP_DIR, OUTREACH_DIR, PROOFS_DIR
     global LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR
 
     BASE_APP_DIR = _get_base_dir()
@@ -86,6 +100,9 @@ def _refresh_paths(profile_name: str | None = None) -> Path:
     ENV_PATH = APP_DIR / ".env"
     TAILORED_DIR = APP_DIR / "tailored_resumes"
     COVER_LETTER_DIR = APP_DIR / "cover_letters"
+    PREP_DIR = APP_DIR / "interview_prep"
+    OUTREACH_DIR = APP_DIR / "outreach"
+    PROOFS_DIR = APP_DIR / "proofs"
     LOG_DIR = APP_DIR / "logs"
     CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
     APPLY_WORKER_DIR = APP_DIR / "apply-workers"
@@ -228,7 +245,18 @@ def get_chrome_user_data() -> Path:
 def ensure_dirs() -> None:
     """Create all required directories for the active profile."""
     _refresh_paths()
-    for d in [BASE_APP_DIR, APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        BASE_APP_DIR,
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        PREP_DIR,
+        OUTREACH_DIR,
+        PROOFS_DIR,
+        LOG_DIR,
+        CHROME_WORKER_DIR,
+        APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -274,13 +302,22 @@ def load_sites_config() -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
-def load_employers() -> list[dict]:
-    """Load employers list from bundled employers.yaml."""
+def load_employers() -> list[dict] | dict:
+    """Load employers registry from bundled employers.yaml."""
     path = CONFIG_DIR / "employers.yaml"
     if not path.exists():
         return []
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return data.get("employers", [])
+
+
+def load_ats_employers() -> dict[str, list[dict]]:
+    """Load direct ATS employer registries (greenhouse, lever, ashby, smartrecruiters) from employers.yaml."""
+    path = CONFIG_DIR / "employers.yaml"
+    if not path.exists():
+        return {}
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data.get("ats_employers", {})
 
 
 def is_manual_ats(url: str | None) -> bool:
@@ -499,7 +536,7 @@ TIER_LABELS = {
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
-    1: ["init", "run discover", "run enrich", "status", "dashboard", "profiles"],
+    1: ["init", "run discover", "run enrich", "status", "dashboard", "serve", "profiles", "export", "prep", "outreach", "memory"],
     2: ["run score", "run tailor", "run cover", "run pdf", "run"],
     3: ["apply"],
 }
@@ -514,7 +551,7 @@ def get_tier() -> int:
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(os.environ.get(k) for k in LLM_ENV_KEYS)
     if not has_llm:
         return 1
 
@@ -546,8 +583,8 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not any(os.environ.get(k) for k in LLM_ENV_KEYS):
+        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY")
     if required >= 3:
         if not shutil.which("claude"):
             missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
@@ -582,7 +619,7 @@ def require_init() -> None:
 def has_llm_configured() -> bool:
     """Return True if an LLM API key or local endpoint URL is configured."""
     load_env()
-    return any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    return any(os.environ.get(k) for k in LLM_ENV_KEYS)
 
 
 def require_tier(required: int, feature: str = "this command") -> None:

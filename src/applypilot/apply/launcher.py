@@ -189,6 +189,7 @@ def mark_result(url: str, status: str, error: str | None = None,
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                           crm_stage = 'applied',
                            apply_error = NULL, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
@@ -273,6 +274,7 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                           crm_stage = 'applied',
                            apply_error = NULL, agent_id = NULL
             WHERE url = ?
         """, (now, url))

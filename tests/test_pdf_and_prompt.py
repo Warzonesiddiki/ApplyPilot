@@ -45,6 +45,12 @@ B.Sc. Computer Science & Engineering"""
     assert "&lt;5ms &amp; cut" in html
     assert "<10ms" not in html
 
+    # Verify selectable PDF themes render their custom typography & layout rules
+    html_exec = build_html(parsed, theme="executive_uk_eu")
+    assert "Georgia" in html_exec
+    html_compact = build_html(parsed, theme="compact_ats")
+    assert "8.6pt" in html_compact
+
 
 def test_cover_letter_detection_and_dedicated_html_template(tmp_path: Path) -> None:
     """Cover letters are detected and rendered with the business-letter HTML template."""

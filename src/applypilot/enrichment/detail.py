@@ -674,11 +674,45 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
-                    conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                    from applypilot.enrichment.sponsors import evaluate_sponsorship_and_metadata
+
+                    row_meta = conn.execute(
+                        "SELECT company, location FROM jobs WHERE url = ?", (url,)
+                    ).fetchone()
+                    comp_name = (row_meta[0] if row_meta else None) or site
+                    loc_name = row_meta[1] if row_meta else None
+                    meta = evaluate_sponsorship_and_metadata(
+                        comp_name, title, result.get("full_description"), loc_name
                     )
+                    if meta["is_expired"]:
+                        conn.execute(
+                            "UPDATE jobs SET full_description = ?, application_url = ?, "
+                            "detail_scraped_at = ?, detail_error = 'expired_listing', "
+                            "apply_status = 'expired', crm_stage = 'rejected', "
+                            "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
+                            (
+                                result.get("full_description"),
+                                result.get("application_url"),
+                                now,
+                                meta["sponsor_status"],
+                                meta["work_arrangement"],
+                                url,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE jobs SET full_description = ?, application_url = ?, "
+                            "detail_scraped_at = ?, detail_error = NULL, "
+                            "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
+                            (
+                                result.get("full_description"),
+                                result.get("application_url"),
+                                now,
+                                meta["sponsor_status"],
+                                meta["work_arrangement"],
+                                url,
+                            ),
+                        )
                 else:
                     stats["error"] += 1
                     conn.execute(

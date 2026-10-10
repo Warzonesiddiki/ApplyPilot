@@ -18,14 +18,15 @@ pip install -e ".[dev]"
 playwright install chromium
 ```
 
-This installs ApplyPilot in editable mode with all development dependencies (pytest, ruff, etc.) and downloads the Chromium browser binary for Playwright.
+This installs ApplyPilot in editable mode with all development dependencies (pytest/pytest-cov, Ruff, and mypy) and downloads the Chromium browser binary for Playwright.
 
 ### Verify Installation
 
 ```bash
 applypilot --version
 pytest tests/ -v
-ruff check src/
+ruff check src/ tests/
+mypy
 ```
 
 ## How to Contribute

@@ -9,12 +9,22 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any, TypedDict
 
 import httpx
 
 from applypilot import config
 
 log = logging.getLogger(__name__)
+
+
+class NotificationResult(TypedDict):
+    sent: list[str]
+    errors: list[str]
+
+
+class DailyDigestResult(NotificationResult):
+    digest: str
 
 
 def has_notification_channel() -> bool:
@@ -28,7 +38,7 @@ def has_notification_channel() -> bool:
     return has_webhook or has_tg
 
 
-def send_notification(message: str, title: str = "ApplyPilot Update") -> dict:
+def send_notification(message: str, title: str = "ApplyPilot Update") -> NotificationResult:
     """Dispatch a notification message to configured Webhook and/or Telegram channels."""
     config.load_env()
     webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
@@ -40,7 +50,7 @@ def send_notification(message: str, title: str = "ApplyPilot Update") -> dict:
 
     if webhook_url:
         try:
-            payload: dict = {"text": f"*{title}*\n{message}", "content": f"**{title}**\n{message}"}
+            payload: dict[str, str] = {"text": f"*{title}*\n{message}", "content": f"**{title}**\n{message}"}
             with httpx.Client(timeout=10.0) as client:
                 resp = client.post(webhook_url, json=payload)
                 resp.raise_for_status()
@@ -64,7 +74,7 @@ def send_notification(message: str, title: str = "ApplyPilot Update") -> dict:
     return {"sent": sent_channels, "errors": errors}
 
 
-def notify_pipeline_summary(stats: dict, profile_name: str | None = None) -> dict:
+def notify_pipeline_summary(stats: dict[str, Any], profile_name: str | None = None) -> NotificationResult:
     """Send a pipeline summary notification if a channel is configured."""
     if not has_notification_channel():
         return {"sent": [], "errors": []}
@@ -120,12 +130,11 @@ def build_daily_digest(min_score: int = 8, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
-def send_daily_digest(min_score: int = 8, limit: int = 5) -> dict:
+def send_daily_digest(min_score: int = 8, limit: int = 5) -> DailyDigestResult:
     """Format and dispatch the Daily Digest to configured webhook/Telegram channels."""
     digest = build_daily_digest(min_score=min_score, limit=limit)
     if not has_notification_channel():
         return {"sent": [], "errors": [], "digest": digest}
     res = send_notification(digest, title="ApplyPilot Daily Digest")
-    res["digest"] = digest
-    return res
+    return {**res, "digest": digest}
 

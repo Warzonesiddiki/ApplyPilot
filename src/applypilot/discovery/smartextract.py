@@ -18,34 +18,62 @@ import re
 import sqlite3
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote_plus
+from collections.abc import Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from typing import Any, TypeVar
+from urllib.parse import quote_plus, urlsplit
 
 import yaml
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from pydantic import BaseModel
+
+from applypilot.schemas import ApiRelevanceResponse, SelectorPlanResponse, StrategyResponse
+from playwright.sync_api import Page, Response, sync_playwright
 
 from applypilot import config
+from applypilot.browser import install_dom_scraping_routes
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_stats, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
+StructuredOutput = TypeVar("StructuredOutput", bound=BaseModel)
 
 # Fix Windows encoding -- prevents charmap errors on emoji/unicode in job titles
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for output_stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(output_stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_MAX_CAPTURED_API_RESPONSES = 24
+_MAX_API_RESPONSE_BYTES = 1_000_000
+_MAX_API_RESPONSE_CHARS = 256_000
+_MAX_JSON_LD_DOCUMENTS = 16
+_MAX_JSON_LD_DOCUMENT_CHARS = 256_000
+_MAX_JSON_LD_TOTAL_CHARS = 1_000_000
+_MAX_PAGE_HTML_CHARS = 2_000_000
+_MAX_SCRAPE_WORKERS = 8
+
+
+def _bounded_worker_count(workers: int) -> int:
+    """Clamp browser scraping concurrency to a resource-safe range."""
+    if workers < 1:
+        log.warning("Smart-extract worker count must be positive; using one worker")
+        return 1
+    if workers > _MAX_SCRAPE_WORKERS:
+        log.warning("Capping smart-extract workers at %d (requested %d)", _MAX_SCRAPE_WORKERS, workers)
+        return _MAX_SCRAPE_WORKERS
+    return workers
 
 
 # -- Location filtering -------------------------------------------------------
 
-def _load_location_filter(search_cfg: dict | None = None):
+def _load_location_filter(search_cfg: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
     """Load location accept/reject lists from search config."""
     return config.load_location_filters(search_cfg)
 
@@ -57,19 +85,32 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
 # -- Site configuration from YAML --------------------------------------------
 
-def load_sites() -> list[dict]:
+def load_sites() -> list[dict[str, Any]]:
     """Load scraping target sites from config/sites.yaml."""
     path = CONFIG_DIR / "sites.yaml"
     if not path.exists():
         log.warning("sites.yaml not found at %s", path)
         return []
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("sites", [])
+    data: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        log.warning("Invalid sites.yaml: expected a top-level mapping")
+        return []
+    sites = data.get("sites", [])
+    if not isinstance(sites, list):
+        log.warning("Invalid sites.yaml: 'sites' must be a list")
+        return []
+    valid_sites: list[dict[str, Any]] = []
+    for site in sites:
+        if isinstance(site, dict):
+            valid_sites.append(site)
+        else:
+            log.warning("Skipping invalid site entry %r", site)
+    return valid_sites
 
 
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
-    jobs: list[dict],
+    jobs: list[dict[str, Any]],
     site: str,
     strategy: str,
     accept_locs: list[str],
@@ -78,7 +119,7 @@ def _store_jobs_filtered(
     """Store jobs with location filtering and full v0.5 metadata enrichment. Returns (new, existing)."""
     from applypilot.database import store_jobs
 
-    valid_jobs: list[dict] = []
+    valid_jobs: list[dict[str, Any]] = []
     filtered = 0
 
     for job in jobs:
@@ -99,10 +140,69 @@ def _store_jobs_filtered(
 
 # -- Page intelligence collector ---------------------------------------------
 
-def collect_page_intelligence(url: str, headless: bool = True) -> dict:
+def _capture_bounded_page_html(page: Page, max_chars: int = _MAX_PAGE_HTML_CHARS) -> tuple[str, bool]:
+    """Transfer only a bounded HTML prefix from the browser process."""
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    captured: Any = page.evaluate(
+        """(limit) => {
+            const html = document.documentElement?.outerHTML ?? "";
+            let end = Math.min(limit, html.length);
+            if (end > 0 && end < html.length) {
+                const previous = html.charCodeAt(end - 1);
+                const next = html.charCodeAt(end);
+                if (previous >= 0xD800 && previous <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) {
+                    end -= 1;
+                }
+            }
+            return {html: html.slice(0, end), truncated: end < html.length};
+        }""",
+        max_chars,
+    )
+    if not isinstance(captured, dict):
+        raise TypeError("Browser returned invalid bounded HTML data")
+    html = captured.get("html")
+    truncated = captured.get("truncated")
+    if not isinstance(html, str) or not isinstance(truncated, bool):
+        raise TypeError("Browser returned invalid bounded HTML fields")
+    return html, truncated
+
+
+def _api_response_body_within_limit(body: str) -> bool:
+    """Return whether an intercepted API body is small enough to retain."""
+    return len(body) <= _MAX_API_RESPONSE_CHARS
+
+
+def _should_capture_api_response(url: str, headers: Mapping[str, str], candidate_count: int) -> bool:
+    """Bound inspected API responses and skip known assets/unknown-size payloads."""
+    if candidate_count >= _MAX_CAPTURED_API_RESPONSES:
+        return False
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError:
+        return False
+    lowered_url = url.lower()
+    asset_suffixes = (".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico", ".gif", ".webp")
+    if parsed_url.path.lower().endswith(asset_suffixes):
+        return False
+    normalized_headers = {name.lower(): value for name, value in headers.items()}
+    content_type = normalized_headers.get("content-type", "").lower()
+    if not ("json" in content_type or "/api/" in lowered_url or "algolia" in lowered_url or "graphql" in lowered_url):
+        return False
+    content_length = normalized_headers.get("content-length")
+    if content_length is None:
+        return False
+    try:
+        response_bytes = int(content_length)
+    except ValueError:
+        return False
+    return 0 <= response_bytes <= _MAX_API_RESPONSE_BYTES
+
+
+def collect_page_intelligence(url: str, headless: bool = True) -> dict[str, Any]:
     """Load a page with Playwright and collect every signal a scraping engineer
     would look at in DevTools. Returns a structured intelligence report."""
-    intel: dict = {
+    intel: dict[str, Any] = {
         "url": url,
         "json_ld": [],
         "api_responses": [],
@@ -112,155 +212,195 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
         "card_candidates": [],
     }
 
-    captured_responses: list[dict] = []
+    captured_responses: list[dict[str, Any]] = []
+    candidate_count = 0
 
-    def on_response(response):
-        ct = response.headers.get("content-type", "")
+    def on_response(response: Response) -> None:
+        nonlocal candidate_count
         rurl = response.url
-        if any(ext in rurl for ext in [".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico", ".gif", ".webp"]):
+        if not _should_capture_api_response(rurl, response.headers, candidate_count):
             return
-        if "json" in ct or "/api/" in rurl or "algolia" in rurl or "graphql" in rurl:
+        candidate_count += 1
+        try:
+            body = response.text()
+            if not _api_response_body_within_limit(body):
+                return
             try:
-                body = response.text()
-                try:
-                    data = json.loads(body)
-                except Exception:
-                    data = None
-                captured_responses.append({
-                    "url": rurl,
-                    "status": response.status,
-                    "size": len(body),
-                    "data": data,
-                })
-            except Exception:
-                pass
+                data = json.loads(body)
+            except (json.JSONDecodeError, TypeError):
+                data = None
+            captured_responses.append({
+                "url": rurl,
+                "status": response.status,
+                "size": len(body),
+                "data": data,
+            })
+        except Exception:
+            pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        page = browser.new_page(user_agent=UA)
-        page.on("response", on_response)
+        context = None
+        page = None
+        try:
+            context = browser.new_context(user_agent=UA)
+            install_dom_scraping_routes(context)
+            page = context.new_page()
+            page.on("response", on_response)
+            page.goto(url, timeout=60000)
+            page.wait_for_load_state("networkidle")
 
-        page.goto(url, timeout=60000)
-        page.wait_for_load_state("networkidle")
+            intel["page_title"] = page.title()
 
-        intel["page_title"] = page.title()
+            # 1. JSON-LD (bounded by count, per-document size, and total transferred text)
+            json_ld_texts: Any = page.evaluate(
+                """([maxDocuments, maxDocumentChars, maxTotalChars]) => {
+                    const texts = [];
+                    let totalChars = 0;
+                    for (const element of document.querySelectorAll('script[type="application/ld+json"]')) {
+                        if (texts.length >= maxDocuments) break;
+                        const text = element.textContent ?? "";
+                        if (text.length > maxDocumentChars || totalChars + text.length > maxTotalChars) continue;
+                        texts.push(text);
+                        totalChars += text.length;
+                    }
+                    return texts;
+                }""",
+                [_MAX_JSON_LD_DOCUMENTS, _MAX_JSON_LD_DOCUMENT_CHARS, _MAX_JSON_LD_TOTAL_CHARS],
+            )
+            if isinstance(json_ld_texts, list):
+                for json_ld_text in json_ld_texts:
+                    if not isinstance(json_ld_text, str):
+                        continue
+                    try:
+                        intel["json_ld"].append(json.loads(json_ld_text))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
 
-        # 1. JSON-LD
-        for el in page.query_selector_all('script[type="application/ld+json"]'):
-            try:
-                data = json.loads(el.inner_text())
-                intel["json_ld"].append(data)
-            except Exception:
-                pass
+            # 2. __NEXT_DATA__, bounded before transferring its contents to Python.
+            next_data = page.query_selector("script#__NEXT_DATA__")
+            if next_data:
+                text_length: Any = next_data.evaluate("element => (element.textContent ?? '').length")
+                if isinstance(text_length, int) and 0 <= text_length <= _MAX_API_RESPONSE_CHARS:
+                    next_data_text = next_data.inner_text()
+                    if _api_response_body_within_limit(next_data_text):
+                        try:
+                            intel["next_data"] = json.loads(next_data_text)
+                        except json.JSONDecodeError:
+                            pass
 
-        # 2. __NEXT_DATA__
-        next_data = page.query_selector("script#__NEXT_DATA__")
-        if next_data:
-            try:
-                intel["next_data"] = json.loads(next_data.inner_text())
-            except Exception:
-                pass
-
-        # 3. data-testid attributes
-        intel["data_testids"] = page.evaluate("""
-            () => {
-                const els = document.querySelectorAll('[data-testid]');
-                const results = [];
-                els.forEach(el => {
-                    results.push({
-                        testid: el.getAttribute('data-testid'),
-                        tag: el.tagName.toLowerCase(),
-                        text: el.innerText?.slice(0, 80) || ''
-                    });
-                });
-                return results.slice(0, 50);
-            }
-        """)
-
-        # 4. DOM stats
-        intel["dom_stats"] = page.evaluate("""
-            () => {
-                const body = document.body;
-                return {
-                    total_elements: body.querySelectorAll('*').length,
-                    links: body.querySelectorAll('a[href]').length,
-                    headings: body.querySelectorAll('h1,h2,h3,h4').length,
-                    lists: body.querySelectorAll('ul,ol').length,
-                    tables: body.querySelectorAll('table').length,
-                    articles: body.querySelectorAll('article').length,
-                    has_data_ids: body.querySelectorAll('[data-id]').length,
-                };
-            }
-        """)
-
-        # 5. Find repeating card-like elements
-        intel["card_candidates"] = page.evaluate("""
-            () => {
-                const candidates = [];
-                const allParents = document.querySelectorAll('*');
-
-                for (const parent of allParents) {
-                    const children = Array.from(parent.children);
-                    if (children.length < 3) continue;
-
-                    const tagCounts = {};
-                    children.forEach(c => {
-                        const key = c.tagName;
-                        tagCounts[key] = (tagCounts[key] || 0) + 1;
-                    });
-
-                    const dominant = Object.entries(tagCounts).sort((a,b) => b[1]-a[1])[0];
-                    if (!dominant || dominant[1] < 3) continue;
-
-                    const repeatingChildren = children.filter(c => c.tagName === dominant[0]);
-                    const withText = repeatingChildren.filter(c => c.innerText?.trim().length > 20);
-                    if (withText.length < 3) continue;
-
-                    const withLinks = withText.filter(c => c.querySelector('a[href]'));
-                    const score = withLinks.length * 2 + withText.length;
-
-                    const parentId = parent.id ? '#' + parent.id : '';
-                    const parentClasses = Array.from(parent.classList).filter(c => c.length < 30).slice(0, 3).join('.');
-                    const parentTag = parent.tagName.toLowerCase();
-                    const parentSelector = parentTag + (parentId || (parentClasses ? '.' + parentClasses : ''));
-
-                    const childTag = dominant[0].toLowerCase();
-                    const sampleChild = withText[0];
-                    const childClasses = Array.from(sampleChild.classList).filter(c => c.length < 30).slice(0, 3).join('.');
-                    const childSelector = childTag + (childClasses ? '.' + childClasses : '');
-
-                    const examples = withText.slice(0, 3).map(c => {
-                        const clone = c.cloneNode(true);
-                        clone.querySelectorAll('script,style,svg,noscript').forEach(el => el.remove());
-                        const html = clone.outerHTML;
-                        return html.length > 5000 ? html.slice(0, 5000) + '...' : html;
-                    });
-
-                    candidates.push({
-                        parent_selector: parentSelector,
-                        child_selector: childSelector,
-                        child_tag: childTag,
-                        total_children: repeatingChildren.length,
-                        with_text: withText.length,
-                        with_links: withLinks.length,
-                        score: score,
-                        examples: examples,
-                    });
+            # 3. data-testid attributes
+            intel["data_testids"] = page.evaluate("""
+                () => {
+                    const els = document.querySelectorAll('[data-testid]');
+                    const results = [];
+                    for (const el of els) {
+                        if (results.length >= 50) break;
+                        results.push({
+                            testid: el.getAttribute('data-testid'),
+                            tag: el.tagName.toLowerCase(),
+                            text: el.innerText?.slice(0, 80) || ''
+                        });
+                    }
+                    return results;
                 }
+            """)
 
-                candidates.sort((a,b) => b.score - a.score);
-                return candidates.slice(0, 3);
-            }
-        """)
+            # 4. DOM stats
+            intel["dom_stats"] = page.evaluate("""
+                () => {
+                    const body = document.body;
+                    return {
+                        total_elements: body.querySelectorAll('*').length,
+                        links: body.querySelectorAll('a[href]').length,
+                        headings: body.querySelectorAll('h1,h2,h3,h4').length,
+                        lists: body.querySelectorAll('ul,ol').length,
+                        tables: body.querySelectorAll('table').length,
+                        articles: body.querySelectorAll('article').length,
+                        has_data_ids: body.querySelectorAll('[data-id]').length,
+                    };
+                }
+            """)
 
-        # Capture full rendered HTML
-        intel["full_html"] = page.content()
+            # 5. Find repeating card-like elements
+            intel["card_candidates"] = page.evaluate("""
+                () => {
+                    const candidates = [];
+                    const allParents = document.querySelectorAll('*');
+                    const scanCount = Math.min(allParents.length, 10000);
 
-        browser.close()
+                    for (let parentIndex = 0; parentIndex < scanCount; parentIndex++) {
+                        const parent = allParents[parentIndex];
+                        const children = Array.from(parent.children);
+                        if (children.length < 3) continue;
+
+                        const tagCounts = {};
+                        children.forEach(c => {
+                            const key = c.tagName;
+                            tagCounts[key] = (tagCounts[key] || 0) + 1;
+                        });
+
+                        const dominant = Object.entries(tagCounts).sort((a,b) => b[1]-a[1])[0];
+                        if (!dominant || dominant[1] < 3) continue;
+
+                        const repeatingChildren = children.filter(c => c.tagName === dominant[0]);
+                        const withText = repeatingChildren.filter(c => c.innerText?.trim().length > 20);
+                        if (withText.length < 3) continue;
+
+                        const withLinks = withText.filter(c => c.querySelector('a[href]'));
+                        const score = withLinks.length * 2 + withText.length;
+
+                        const parentId = parent.id ? '#' + parent.id : '';
+                        const parentClasses = Array.from(parent.classList).filter(c => c.length < 30).slice(0, 3).join('.');
+                        const parentTag = parent.tagName.toLowerCase();
+                        const parentSelector = parentTag + (parentId || (parentClasses ? '.' + parentClasses : ''));
+
+                        const childTag = dominant[0].toLowerCase();
+                        const sampleChild = withText[0];
+                        const childClasses = Array.from(sampleChild.classList).filter(c => c.length < 30).slice(0, 3).join('.');
+                        const childSelector = childTag + (childClasses ? '.' + childClasses : '');
+
+                        const examples = withText.slice(0, 3).map(c => {
+                            const clone = c.cloneNode(true);
+                            clone.querySelectorAll('script,style,svg,noscript').forEach(el => el.remove());
+                            const html = clone.outerHTML;
+                            return html.length > 5000 ? html.slice(0, 5000) + '...' : html;
+                        });
+
+                        candidates.push({
+                            parent_selector: parentSelector,
+                            child_selector: childSelector,
+                            child_tag: childTag,
+                            total_children: repeatingChildren.length,
+                            with_text: withText.length,
+                            with_links: withLinks.length,
+                            score: score,
+                            examples: examples,
+                        });
+                    }
+
+                    candidates.sort((a,b) => b.score - a.score);
+                    return candidates.slice(0, 3);
+                }
+            """)
+
+            # Keep CSS extraction useful without transferring arbitrarily large documents.
+            intel["full_html"], intel["full_html_truncated"] = _capture_bounded_page_html(page)
+
+        finally:
+            try:
+                if page is not None:
+                    page.close()
+            finally:
+                try:
+                    if context is not None:
+                        context.close()
+                finally:
+                    browser.close()
 
     # Process API responses
     for resp in captured_responses:
-        summary: dict = {
+        summary: dict[str, Any] = {
             "url": resp["url"][:200],
             "status": resp["status"],
             "size": resp["size"],
@@ -277,7 +417,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
                 summary["type"] = "object"
                 summary["keys"] = list(data.keys())[:20]
 
-                def _explore_nested(obj, path_prefix, depth=0):
+                def _explore_nested(obj: Any, path_prefix: str, depth: int = 0) -> None:
                     if depth > 3 or not isinstance(obj, dict):
                         return
                     for key in list(obj.keys())[:15]:
@@ -333,13 +473,13 @@ or
 No explanation, no markdown, no thinking."""
 
 
-def judge_api_responses(api_responses: list[dict]) -> list[dict]:
+def judge_api_responses(api_responses: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Use the LLM to filter API responses, keeping only job-relevant ones."""
     if not api_responses:
         return []
 
     client = get_client()
-    relevant: list[dict] = []
+    relevant: list[dict[str, Any]] = []
 
     for resp in api_responses:
         fields = ""
@@ -367,10 +507,14 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
         )
 
         try:
-            raw = client.ask(prompt, temperature=0.0, max_tokens=1024)
-            verdict = extract_json(raw)
-            is_relevant = verdict.get("relevant", False)
-            reason = verdict.get("reason", "?")
+            verdict = client.ask_structured(
+                prompt,
+                response_model=ApiRelevanceResponse,
+                temperature=0.0,
+                max_tokens=1024,
+            )
+            is_relevant = verdict.relevant
+            reason = verdict.reason
             log.info("Judge: %s -> %s (%s)", resp.get("url", "?")[:80],
                      "KEEP" if is_relevant else "DROP", reason)
             if is_relevant:
@@ -384,7 +528,7 @@ def judge_api_responses(api_responses: list[dict]) -> list[dict]:
 
 # -- Phase 1: strategy selection ---------------------------------------------
 
-def format_strategy_briefing(intel: dict) -> str:
+def format_strategy_briefing(intel: dict[str, Any]) -> str:
     """Lightweight briefing for strategy selection. No raw DOM."""
     sections: list[str] = []
     sections.append(f"PAGE: {intel['url']}")
@@ -530,7 +674,7 @@ def clean_card_html(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup.find_all(True):
-        new_attrs: dict = {}
+        new_attrs: dict[str, Any] = {}
         for attr, val in list(tag.attrs.items()):
             if attr in _ALLOWED_ATTRS or any(attr.startswith(p) for p in _ALLOWED_PREFIXES):
                 new_attrs[attr] = val
@@ -548,7 +692,7 @@ def clean_page_html(html: str, max_chars: int = 150_000) -> str:
     """Strip full page HTML to essential structure for LLM card detection."""
     soup = BeautifulSoup(html, "html.parser")
 
-    main = soup.find("main") or soup.find(attrs={"role": "main"})
+    main = soup.find("main") or soup.select_one('[role="main"]')
     if main and len(str(main)) > 1000:
         soup = BeautifulSoup(str(main), "html.parser")
 
@@ -557,7 +701,7 @@ def clean_page_html(html: str, max_chars: int = 150_000) -> str:
         tag.decompose()
 
     for tag in soup.find_all(True):
-        new_attrs: dict = {}
+        new_attrs: dict[str, Any] = {}
         for attr, val in list(tag.attrs.items()):
             if attr in _ALLOWED_ATTRS or any(attr.startswith(p) for p in _ALLOWED_PREFIXES):
                 new_attrs[attr] = val
@@ -612,47 +756,48 @@ PAGE HTML:
 
 # -- LLM helpers -------------------------------------------------------------
 
-def ask_llm(prompt: str) -> tuple[str, float, dict]:
-    """Send prompt to LLM. Returns (response_text, seconds_taken, metadata)."""
+def ask_llm(prompt: str) -> tuple[str, float, dict[str, int | str]]:
+    """Send an unstructured prompt to the LLM and return timing metadata."""
     client = get_client()
-    t0 = time.time()
+    started = time.perf_counter()
     text = client.ask(prompt, temperature=0.0, max_tokens=4096)
-    elapsed = time.time() - t0
-    meta = {
+    elapsed = time.perf_counter() - started
+    return text, elapsed, {"finish_reason": "stop", "prompt_chars": len(prompt), "response_chars": len(text)}
+
+
+def ask_structured_llm(
+    prompt: str,
+    response_model: type[StructuredOutput],
+) -> tuple[StructuredOutput, float, dict[str, int | str]]:
+    """Call a Pydantic-schema-constrained LLM response."""
+    client = get_client()
+    started = time.perf_counter()
+    response = client.ask_structured(
+        prompt,
+        response_model=response_model,
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    elapsed = time.perf_counter() - started
+    response_chars = len(response.model_dump_json())
+    return response, elapsed, {
         "finish_reason": "stop",
         "prompt_chars": len(prompt),
-        "response_chars": len(text),
+        "response_chars": response_chars,
     }
-    return text, elapsed, meta
 
 
-def extract_json(text: str) -> dict:
-    """Extract JSON from LLM response, handling think tags and code fences."""
-    if "<think>" in text:
-        after = text.split("</think>")[-1].strip()
-        if after:
-            text = after
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0]
-    elif "```" in text:
-        text = text.split("```")[1].split("```")[0]
-    text = text.strip()
-    text = re.sub(r'\\([^"\\\/bfnrtu])', r'\1', text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    while text.endswith("}") or text.endswith("]"):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            text = text[:-1].rstrip()
-    raise json.JSONDecodeError("Could not parse JSON", text, 0)
+def extract_json(text: str) -> dict[str, Any]:
+    """Parse a complete JSON object without stripping fences or regex-repairing output."""
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a JSON object")
+    return parsed
 
 
 # -- JSON path resolution ---------------------------------------------------
 
-def resolve_json_path_raw(data, path: str):
+def resolve_json_path_raw(data: Any, path: str) -> Any:
     """Navigate a JSON path and return whatever is there (including lists/dicts)."""
     if not path or not data:
         return None
@@ -671,7 +816,7 @@ def resolve_json_path_raw(data, path: str):
         return None
 
 
-def resolve_json_path(data, path: str):
+def resolve_json_path(data: Any, path: str) -> str | None:
     """Simple JSON path resolver with type coercion for display."""
     if not path or not data:
         return None
@@ -688,7 +833,8 @@ def resolve_json_path(data, path: str):
         if isinstance(current, (str, int, float)):
             return str(current) if not isinstance(current, str) else current
         elif isinstance(current, dict):
-            return current.get("name", current.get("text", str(current)[:100]))
+            label = current.get("name", current.get("text", str(current)[:100]))
+            return None if label is None else str(label)
         elif isinstance(current, list):
             if current and isinstance(current[0], dict):
                 return ", ".join(str(item.get("name", item.get("text", ""))) for item in current[:3])
@@ -700,14 +846,14 @@ def resolve_json_path(data, path: str):
 
 # -- Extraction executors ----------------------------------------------------
 
-def execute_json_ld(intel: dict, plan: dict) -> list[dict]:
+def execute_json_ld(intel: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract jobs from JSON-LD JobPosting entries."""
     ext = plan["extraction"]
-    jobs: list[dict] = []
+    jobs: list[dict[str, Any]] = []
     for entry in intel["json_ld"]:
         if not isinstance(entry, dict) or entry.get("@type") != "JobPosting":
             continue
-        job: dict = {}
+        job: dict[str, Any] = {}
         for field in ["title", "salary", "description", "location", "url"]:
             path = ext.get(field)
             if not path or path == "null":
@@ -718,7 +864,7 @@ def execute_json_ld(intel: dict, plan: dict) -> list[dict]:
     return jobs
 
 
-def execute_api_response(intel: dict, plan: dict) -> list[dict]:
+def execute_api_response(intel: dict[str, Any], plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract jobs from intercepted API response data."""
     ext = plan["extraction"]
     url_pattern = ext.get("url_pattern", "")
@@ -739,11 +885,11 @@ def execute_api_response(intel: dict, plan: dict) -> list[dict]:
         log.warning("items_path '%s' did not resolve to a list (got %s)", items_path, type(items).__name__)
         return []
 
-    jobs: list[dict] = []
+    jobs: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict):
             continue
-        job: dict = {}
+        job: dict[str, Any] = {}
         for field in ["title", "salary", "description", "location", "url"]:
             path = ext.get(field)
             if not path or path == "null":
@@ -754,7 +900,7 @@ def execute_api_response(intel: dict, plan: dict) -> list[dict]:
     return jobs
 
 
-def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
+def execute_css_selectors(intel: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Phase 2: Send full cleaned page HTML to LLM for card detection + selector generation.
     Returns (selectors, jobs)."""
     full_html = intel.get("full_html", "")
@@ -768,18 +914,13 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     prompt = FULL_PAGE_SELECTOR_PROMPT.format(page_html=cleaned)
 
     try:
-        raw, elapsed, meta = ask_llm(prompt)
-    except Exception as e:
-        log.error("LLM_ERROR in Phase 2: %s", e)
+        selector_response, elapsed, meta = ask_structured_llm(prompt, SelectorPlanResponse)
+    except Exception as exc:
+        log.error("Structured selector generation failed: %s", exc)
         return {}, []
 
-    log.info("Phase 2 LLM: %d chars, %.1fs", meta['response_chars'], elapsed)
-
-    try:
-        selectors = extract_json(raw)
-    except Exception as e:
-        log.error("PARSE_ERROR in Phase 2: %s | raw: %s", e, raw[:500])
-        return {}, []
+    selectors = selector_response.model_dump(exclude_none=True)
+    log.info("Phase 2 LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
 
     if "error" in selectors:
         log.warning("LLM: %s", selectors["error"])
@@ -798,9 +939,9 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
 
     log.info("Matched %d cards", len(cards))
 
-    jobs: list[dict] = []
+    jobs: list[dict[str, Any]] = []
     for card in cards:
-        job: dict = {}
+        job: dict[str, Any] = {}
         for field in ["title", "salary", "description", "location", "url"]:
             sel = selectors.get(field)
             if not sel or sel == "null":
@@ -821,7 +962,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
 
 # -- Main per-site extraction ------------------------------------------------
 
-def _run_one_site(name: str, url: str) -> dict:
+def _run_one_site(name: str, url: str) -> dict[str, Any]:
     """Run full smart extraction pipeline on one site URL."""
     log.info("=" * 60)
     log.info("%s: %s", name, url)
@@ -866,18 +1007,13 @@ def _run_one_site(name: str, url: str) -> dict:
 
     prompt = STRATEGY_PROMPT.format(briefing=briefing)
     try:
-        raw, elapsed, meta = ask_llm(prompt)
-    except Exception as e:
-        log.error("LLM_ERROR: %s", e)
-        return {"name": name, "status": "LLM_ERROR", "error": str(e)}
+        strategy_response, elapsed, meta = ask_structured_llm(prompt, StrategyResponse)
+        plan = strategy_response.model_dump(exclude_none=True)
+    except Exception as exc:
+        log.error("Structured strategy generation failed: %s", exc)
+        return {"name": name, "status": "LLM_ERROR", "error": str(exc)}
 
     log.info("LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
-
-    try:
-        plan = extract_json(raw)
-    except Exception as e:
-        log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500])
-        return {"name": name, "status": "PARSE_ERROR", "error": str(e), "raw": raw}
 
     strategy = plan.get("strategy", "?")
     reasoning = plan.get("reasoning", "?")
@@ -935,9 +1071,9 @@ def _run_one_site(name: str, url: str) -> dict:
 # -- Target building --------------------------------------------------------
 
 def build_scrape_targets(
-    sites: list[dict] | None = None,
-    search_cfg: dict | None = None,
-) -> list[dict]:
+    sites: list[dict[str, Any]] | None = None,
+    search_cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Build the full list of (name, url) targets from sites + search config queries.
 
     - "search" sites get expanded: 1 URL per query from search config
@@ -958,7 +1094,7 @@ def build_scrape_targets(
     locs = search_cfg.get("locations", [])
     default_location = locs[0]["location"] if locs else ""
 
-    targets: list[dict] = []
+    targets: list[dict[str, Any]] = []
 
     for site in sites:
         site_url = site.get("url", "")
@@ -991,52 +1127,89 @@ def build_scrape_targets(
 # -- Run all sites -----------------------------------------------------------
 
 def _run_all(
-    targets: list[dict],
+    targets: list[dict[str, Any]],
     accept_locs: list[str],
     reject_locs: list[str],
     workers: int = 1,
-) -> dict:
+) -> dict[str, Any]:
     """Run smart extract on all targets.
 
     Sequential by default. When workers > 1, scrapes multiple sites in parallel
     using ThreadPoolExecutor. DB storage is still serialized after each result.
     """
+    workers = _bounded_worker_count(workers)
     conn = init_db()
     pre_stats = get_stats(conn)
     log.info("Database: %d jobs already stored, %d pending detail scrape",
              pre_stats["total"], pre_stats["pending_detail"])
 
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     total_new = 0
     total_existing = 0
 
-    def _process_result(r: dict, target: dict) -> None:
+    def _process_result(r: dict[str, Any], target: dict[str, Any]) -> None:
         nonlocal total_new, total_existing
         jobs = r.get("jobs", [])
         if jobs:
-            new, existing = _store_jobs_filtered(conn, jobs, target["name"],
-                                                  r.get("strategy", "?"),
-                                                  accept_locs, reject_locs)
+            new, existing = _store_jobs_filtered(
+                conn,
+                jobs,
+                target["name"],
+                r.get("strategy", "?"),
+                accept_locs,
+                reject_locs,
+            )
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
 
+    def _append_summary(r: dict[str, Any]) -> None:
+        # Do not retain full job lists or scraped samples after persistence.
+        summary_keys = ("name", "status", "strategy", "total", "titles", "error")
+        summary = {key: r[key] for key in summary_keys if key in r}
+        if "error" in summary:
+            summary["error"] = str(summary["error"])[:500]
+        results.append(summary)
+
     if workers > 1 and len(targets) > 1:
-        # Parallel mode
-        with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
-            future_to_target = {
-                pool.submit(_run_one_site, target["name"], target["url"]): target
-                for target in targets
-            }
-            for future in as_completed(future_to_target):
-                target = future_to_target[future]
+        # Keep at most two bounded waves of futures; submitting all targets at
+        # once retains every result payload until the final target completes.
+        max_workers = min(workers, len(targets))
+        target_iter = iter(targets)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pending: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+
+            def _submit_next() -> bool:
                 try:
-                    r = future.result()
-                except Exception as e:
-                    log.error("Site worker crashed for %s: %s", target["name"], e)
-                    r = {"name": target["name"], "status": "CRASH", "error": str(e), "jobs": [], "total": 0, "titles": 0}
-                results.append(r)
-                _process_result(r, target)
+                    target = next(target_iter)
+                except StopIteration:
+                    return False
+                pending[pool.submit(_run_one_site, target["name"], target["url"])] = target
+                return True
+
+            for _ in range(min(len(targets), max_workers * 2)):
+                _submit_next()
+
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    target = pending.pop(future)
+                    try:
+                        r = future.result()
+                    except Exception as exc:
+                        log.error("Site worker crashed for %s: %s", target["name"], exc)
+                        r = {
+                            "name": target["name"],
+                            "status": "CRASH",
+                            "error": str(exc),
+                            "jobs": [],
+                            "total": 0,
+                            "titles": 0,
+                        }
+                    _process_result(r, target)
+                    _append_summary(r)
+                    del r
+                    _submit_next()
     else:
         # Sequential mode (default)
         for i, target in enumerate(targets):
@@ -1046,8 +1219,8 @@ def _run_all(
             log.info("[%d/%d] %s", i + 1, len(targets), label)
 
             r = _run_one_site(target["name"], target["url"])
-            results.append(r)
             _process_result(r, target)
+            _append_summary(r)
 
     # Summary
     for r in results:
@@ -1068,9 +1241,9 @@ def _run_all(
 # -- Public entry point ------------------------------------------------------
 
 def run_smart_extract(
-    sites: list[dict] | None = None,
+    sites: list[dict[str, Any]] | None = None,
     workers: int = 1,
-) -> dict:
+) -> dict[str, Any]:
     """Main entry point for AI-powered smart extraction.
 
     Loads sites from config/sites.yaml and search queries from the user's
@@ -1083,6 +1256,7 @@ def run_smart_extract(
     Returns:
         Dict with stats: total_new, total_existing, passed, total.
     """
+    workers = _bounded_worker_count(workers)
     search_cfg = config.load_search_config()
     accept_locs, reject_locs = _load_location_filter(search_cfg)
 

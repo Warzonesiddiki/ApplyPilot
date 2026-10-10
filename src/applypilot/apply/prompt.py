@@ -14,6 +14,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from applypilot import config
 from applypilot.scoring.validator import detect_profile_domain
@@ -21,13 +22,13 @@ from applypilot.scoring.validator import detect_profile_domain
 logger = logging.getLogger(__name__)
 
 
-def _format_bool_field(val, default: str = "Yes") -> str:
+def _format_bool_field(val: Any, default: str = "Yes") -> str:
     if isinstance(val, bool):
         return "Yes" if val else "No"
     return str(val) if val is not None and str(val).strip() else default
 
 
-def _build_profile_summary(profile: dict) -> str:
+def _build_profile_summary(profile: dict[str, Any]) -> str:
     """Format the applicant profile section of the prompt."""
     p = profile
     personal = p.get("personal", {})
@@ -115,7 +116,7 @@ def _build_profile_summary(profile: dict) -> str:
     return "\n".join(lines)
 
 
-def _build_location_check(profile: dict, search_config: dict) -> str:
+def _build_location_check(profile: dict[str, Any], search_config: dict[str, Any]) -> str:
     """Build the location eligibility check section of the prompt.
 
     Supports UK & Pan-EU target regions as well as relocation-enabled applications.
@@ -154,7 +155,7 @@ Read the job page. Determine the work arrangement and geography. Then decide:
 Do NOT abort applications located in the United Kingdom, Ireland, Netherlands, Germany, Luxembourg, Switzerland, or any European Union country — those ARE the target markets!"""
 
 
-def _build_salary_section(profile: dict) -> str:
+def _build_salary_section(profile: dict[str, Any]) -> str:
     """Build multi-currency salary negotiation instructions (GBP, EUR, CHF, USD)."""
     comp = profile.get("compensation", {})
     currency = comp.get("salary_currency", "GBP")
@@ -204,7 +205,7 @@ Decision tree:
 7. Asked for a range? -> Give "{symbol}{range_min}-{symbol}{range_max} {currency}" (or local currency equivalent)."""
 
 
-def _build_screening_section(profile: dict) -> str:
+def _build_screening_section(profile: dict[str, Any]) -> str:
     """Build the screening questions guidance section."""
     personal = profile.get("personal", {})
     exp = profile.get("experience", {})
@@ -255,7 +256,7 @@ UK/EU GDPR & Privacy Consent checkboxes ("I consent to the processing of my pers
 EEO/diversity monitoring -> "Decline to self-identify" or "Prefer not to say" for everything."""
 
 
-def _build_hard_rules(profile: dict) -> str:
+def _build_hard_rules(profile: dict[str, Any]) -> str:
     """Build the hard rules section with work auth and name from profile."""
     personal = profile.get("personal", {})
     work_auth = profile.get("work_authorization", {})
@@ -485,7 +486,7 @@ If CapSolver genuinely failed (errorId > 0):
 
 
 def build_prompt(
-    job: dict,
+    job: dict[str, Any],
     tailored_resume: str,
     cover_letter: str | None = None,
     dry_run: bool = False,

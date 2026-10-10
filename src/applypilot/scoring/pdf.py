@@ -11,16 +11,20 @@ import logging
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from applypilot import config
 from applypilot.database import get_connection
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 log = logging.getLogger(__name__)
 
 
 # ── Resume Parser ────────────────────────────────────────────────────────
 
-def parse_resume(text: str) -> dict:
+def parse_resume(text: str) -> dict[str, Any]:
     """Parse a structured text resume into sections.
 
     Expects a format with header lines (name, title, location, contact)
@@ -101,11 +105,11 @@ def parse_skills(text: str) -> list[tuple[str, str]]:
     return skills
 
 
-def parse_entries(text: str) -> list[dict]:
+def parse_entries(text: str) -> list[dict[str, Any]]:
     """Parse experience/project entries from section text."""
-    entries: list[dict] = []
+    entries: list[dict[str, Any]] = []
     lines = text.strip().split("\n")
-    current: dict | None = None
+    current: dict[str, Any] | None = None
 
     for line in lines:
         stripped = line.strip()
@@ -136,7 +140,7 @@ def parse_entries(text: str) -> list[dict]:
 
 # ── HTML Templates (Resume & Cover Letter) ───────────────────────────────
 
-def build_html(resume: dict, theme: str = "modern") -> str:
+def build_html(resume: dict[str, Any], theme: str = "modern") -> str:
     """Build professional resume HTML from parsed data with full HTML escaping and theme support.
 
     Supported themes:
@@ -367,7 +371,7 @@ def is_cover_letter(text: str, text_path: Path | None = None) -> bool:
     return "SUMMARY" not in upper and "EXPERIENCE" not in upper
 
 
-def build_cover_letter_html(text: str, profile: dict | None = None) -> str:
+def build_cover_letter_html(text: str, profile: dict[str, Any] | None = None) -> str:
     """Build clean business-letter HTML for a cover letter."""
     if profile is None:
         try:
@@ -461,7 +465,7 @@ body {{
 
 # ── PDF Renderer ─────────────────────────────────────────────────────────
 
-def render_pdf(html: str, output_path: str, page=None) -> None:
+def render_pdf(html: str, output_path: str, page: Page | None = None) -> None:
     """Render HTML to PDF using Playwright's headless Chromium."""
     if page is not None:
         page.set_content(html, wait_until="networkidle")
@@ -494,7 +498,7 @@ def convert_to_pdf(
     text_path: Path,
     output_path: Path | None = None,
     html_only: bool = False,
-    page=None,
+    page: Page | None = None,
     theme: str | None = None,
 ) -> Path:
     """Convert a text resume or cover letter to PDF (or HTML)."""

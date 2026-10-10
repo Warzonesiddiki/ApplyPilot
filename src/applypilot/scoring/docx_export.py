@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 import zipfile
+from typing import Any
 
 from applypilot import config
 from applypilot.database import ensure_columns, get_connection
@@ -260,7 +261,7 @@ def build_resume_docx_xml(resume_text: str) -> str:
     )
 
 
-def build_cover_letter_docx_xml(text: str, profile: dict | None = None) -> str:
+def build_cover_letter_docx_xml(text: str, profile: dict[str, Any] | None = None) -> str:
     """Build `word/document.xml` for a business cover letter."""
     personal = (profile or {}).get("personal", {}) if isinstance(profile, dict) else {}
     full_name = personal.get("full_name", "")
@@ -314,7 +315,7 @@ def build_cover_letter_docx_xml(text: str, profile: dict | None = None) -> str:
 def convert_to_docx(
     txt_path: Path | str,
     docx_path: Path | str | None = None,
-    profile: dict | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> Path:
     """Convert a tailored resume or cover letter `.txt` file into a valid `.docx` file."""
     src = Path(txt_path)
@@ -343,7 +344,7 @@ def convert_to_docx(
     return out
 
 
-def batch_convert_docx() -> dict:
+def batch_convert_docx() -> dict[str, int]:
     """Convert all tailored resumes and cover letters into `.docx` format and update SQLite."""
     conn = get_connection()
     ensure_columns(conn)

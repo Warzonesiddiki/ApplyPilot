@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import re
 import sqlite3
+from typing import Any
 
 from applypilot import config
 from applypilot.database import get_connection, init_db
@@ -32,7 +33,7 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
 
 def seed_question_bank_from_profile(
     conn: sqlite3.Connection | None = None,
-    profile: dict | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> int:
     """Seed canonical screening questions from the active profile's `profile.json`."""
     if conn is None:
@@ -153,7 +154,7 @@ def upsert_question(
     conn.commit()
 
 
-def list_questions(conn: sqlite3.Connection | None = None) -> list[dict]:
+def list_questions(conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
     """Return all canonical screening questions ordered by category and key."""
     if conn is None:
         conn = init_db()
@@ -168,7 +169,7 @@ def list_questions(conn: sqlite3.Connection | None = None) -> list[dict]:
 
 def build_memory_prompt_section(
     conn: sqlite3.Connection | None = None,
-    profile: dict | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> str:
     """Format canonical screening answers for injection into the Auto-Apply prompt."""
     try:
@@ -236,7 +237,7 @@ def classify_apply_error(error_str: str | None) -> str:
 def reset_transient_failed_jobs(
     include_captcha: bool = False,
     conn: sqlite3.Connection | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Reset failed jobs whose `apply_error` is classified as transient/retryable.
 
     Preserves `permanent_ineligible` failures so closed or ineligible roles are

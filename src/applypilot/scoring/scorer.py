@@ -9,17 +9,20 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
-import re
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 from applypilot import config
-from applypilot.database import ensure_columns, get_connection, get_jobs_by_stage
+from applypilot.database import ensure_columns, get_connection
 from applypilot.enrichment.sponsors import is_job_expired
 from applypilot.llm import get_client
 from applypilot.scoring.ats import compute_ats_coverage, select_best_base_resume
+from applypilot.schemas import ScoreResponse
 
 log = logging.getLogger(__name__)
+_SCORING_BATCH_BASE_SIZE = 16
+_SCORING_BATCH_MAX_SIZE = 64
 
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
@@ -33,77 +36,27 @@ SCORING CRITERIA (1-10):
 - 3-4: Weak match. Significant skill or qualification gaps, would need substantial ramp-up.
 - 1-2: Poor match. Completely different field or experience level.
 
-RESPOND IN EXACTLY THIS FORMAT (no other text):
-SCORE: [1-10]
-SKILLS_SCORE: [1-10]
-QUALIFICATIONS_SCORE: [1-10]
-DOMAIN_SCORE: [1-10]
-LOCATION_SCORE: [1-10]
-KEYWORDS: [comma-separated ATS keywords from the job description that match the candidate]
-MISSING_KEYWORDS: [comma-separated ATS keywords from the job description that should be emphasized or bridged]
-REASONING: [2-3 sentences explaining the score and fit]"""
+Return exactly one JSON object (no Markdown) with these fields:
+- score, skills_score, qualifications_score, domain_score, location_score: integers from 1 to 10
+- keywords, missing_keywords: arrays of strings
+- reasoning: 2-3 sentences explaining the score and fit"""
 
 
-def _extract_int_1_to_10(line: str, default: int = 0) -> int:
-    try:
-        match = re.search(r"\d+", line)
-        if match:
-            return max(1, min(10, int(match.group())))
-    except (AttributeError, ValueError):
-        pass
-    return default
+def _parse_score_response(response: str | ScoreResponse | dict[str, Any]) -> dict[str, Any]:
+    """Validate the LLM scoring response and produce the stable pipeline shape."""
+    if isinstance(response, ScoreResponse):
+        validated = response
+    elif isinstance(response, str):
+        validated = ScoreResponse.model_validate_json(response)
+    else:
+        validated = ScoreResponse.model_validate(response)
+    parsed = validated.model_dump()
+    parsed["keywords"] = ", ".join(parsed["keywords"])
+    parsed["missing_keywords"] = ", ".join(parsed["missing_keywords"])
+    return parsed
 
 
-def _parse_score_response(response: str) -> dict:
-    """Parse the LLM's score response into structured data including 4D sub-scores."""
-    score = 0
-    skills_score = 0
-    qualifications_score = 0
-    domain_score = 0
-    location_score = 0
-    keywords = ""
-    missing_keywords = ""
-    reasoning = response.strip()
-
-    for raw_line in response.split("\n"):
-        line = raw_line.strip()
-        upper = line.upper()
-        if upper.startswith("SCORE:"):
-            score = _extract_int_1_to_10(line, 0)
-        elif upper.startswith("SKILLS_SCORE:"):
-            skills_score = _extract_int_1_to_10(line, 0)
-        elif upper.startswith("QUALIFICATIONS_SCORE:"):
-            qualifications_score = _extract_int_1_to_10(line, 0)
-        elif upper.startswith("DOMAIN_SCORE:"):
-            domain_score = _extract_int_1_to_10(line, 0)
-        elif upper.startswith("LOCATION_SCORE:"):
-            location_score = _extract_int_1_to_10(line, 0)
-        elif upper.startswith("KEYWORDS:"):
-            keywords = line.split(":", 1)[1].strip()
-        elif upper.startswith("MISSING_KEYWORDS:"):
-            missing_keywords = line.split(":", 1)[1].strip()
-        elif upper.startswith("REASONING:"):
-            reasoning = line.split(":", 1)[1].strip()
-
-    if score > 0:
-        skills_score = skills_score or score
-        qualifications_score = qualifications_score or score
-        domain_score = domain_score or score
-        location_score = location_score or score
-
-    return {
-        "score": score,
-        "skills_score": skills_score,
-        "qualifications_score": qualifications_score,
-        "domain_score": domain_score,
-        "location_score": location_score,
-        "keywords": keywords,
-        "missing_keywords": missing_keywords,
-        "reasoning": reasoning,
-    }
-
-
-def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
+def score_job(resume_text: str, job: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
     """Score a single job against the resume with 4D sub-scores, ATS coverage, and expired pre-filtering."""
     company_name = job.get("company") or job.get("site") or "Unknown"
     full_desc = job.get("full_description") or job.get("description") or ""
@@ -148,7 +101,12 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.structured_chat(
+            messages,
+            response_model=ScoreResponse,
+            max_tokens=512,
+            temperature=0.2,
+        )
         parsed = _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
@@ -176,8 +134,8 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
     return parsed
 
 
-def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 1) -> dict:
-    """Score unscored jobs that have full descriptions.
+def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 1) -> dict[str, Any]:
+    """Score eligible jobs in bounded batches to cap database and worker memory.
 
     Args:
         limit: Maximum number of jobs to score in this run.
@@ -195,96 +153,136 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 1) -> dict
 
     conn = get_connection()
     ensure_columns(conn)
+    conditions = "full_description IS NOT NULL"
+    if not rescore:
+        conditions += " AND fit_score IS NULL"
+    snapshot = conn.execute(f"SELECT COUNT(*), MAX(rowid) FROM jobs WHERE {conditions}").fetchone()
+    total_eligible = int(snapshot[0] or 0) if snapshot is not None else 0
+    max_rowid = int(snapshot[1]) if snapshot is not None and snapshot[1] is not None else 0
+    target_count = min(total_eligible, limit) if limit > 0 else total_eligible
 
-    if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
-        params: list = []
-        if limit > 0:
-            query += " LIMIT ?"
-            params.append(limit)
-        jobs = conn.execute(query, params).fetchall()
-    else:
-        jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
-
-    if not jobs:
+    if target_count == 0:
         log.info("No unscored jobs with descriptions found.")
         return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
 
-    if jobs and not isinstance(jobs[0], dict):
-        columns = jobs[0].keys()
-        jobs = [dict(zip(columns, row)) for row in jobs]
-
-    log.info("Scoring %d jobs (workers=%d)...", len(jobs), workers)
-    t0 = time.time()
+    batch_size = max(_SCORING_BATCH_BASE_SIZE, min(max(1, workers) * 2, _SCORING_BATCH_MAX_SIZE))
+    log.info("Scoring %d jobs in batches of at most %d (workers=%d)...", target_count, batch_size, workers)
+    started = time.perf_counter()
+    completed_count = 0
+    scored_count = 0
     errors = 0
-    results: list[dict] = []
+    last_rowid = 0
 
-    def _score_one(job_item: dict) -> tuple[dict, dict]:
-        best_res_txt, variant_name = select_best_base_resume(
-            job_item.get("full_description"), default_resume_path=config.RESUME_PATH, profile=profile
-        )
-        res_txt = best_res_txt or default_resume_text
-        scored = score_job(res_txt, job_item, profile=profile)
-        scored["url"] = job_item["url"]
-        scored["resume_variant"] = variant_name
-        return job_item, scored
-
-    if workers > 1 and len(jobs) > 1:
-        with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
-            futs = [pool.submit(_score_one, j) for j in jobs]
-            for completed, fut in enumerate(as_completed(futs), 1):
-                job, result = fut.result()
-                if result["score"] == 0:
-                    errors += 1
-                else:
-                    results.append(result)
-                log.info(
-                    "[%d/%d] score=%d (ATS=%d%%)  %s",
-                    completed,
-                    len(jobs),
-                    result["score"],
-                    result.get("ats_coverage_pct", 0),
-                    (job.get("title") or "?")[:60],
-                )
-    else:
-        for completed, job in enumerate(jobs, 1):
-            _, result = _score_one(job)
-            if result["score"] == 0:
-                errors += 1
-            else:
-                results.append(result)
-            log.info(
-                "[%d/%d] score=%d (ATS=%d%%)  %s",
-                completed,
-                len(jobs),
-                result["score"],
-                result.get("ats_coverage_pct", 0),
-                (job.get("title") or "?")[:60],
+    def _score_one(job_item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            best_res_txt, variant_name = select_best_base_resume(
+                job_item.get("full_description"), default_resume_path=config.RESUME_PATH, profile=profile
             )
+            res_txt = best_res_txt or default_resume_text
+            scored = score_job(res_txt, job_item, profile=profile)
+            scored["url"] = job_item["url"]
+            scored["resume_variant"] = variant_name
+            return job_item, scored
+        except Exception as exc:
+            log.exception("Unexpected failure preparing score for job %r", job_item.get("url"))
+            return job_item, {"score": 0, "keywords": "", "reasoning": f"Scoring error: {exc}"}
 
-    # Write valid scores (> 0) to DB; leave errors as NULL so they can be retried
-    now = datetime.now(UTC).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
-            "score_breakdown = ?, ats_coverage_pct = COALESCE(ats_coverage_pct, ?), "
-            "crm_stage = CASE WHEN crm_stage IS NULL OR crm_stage = 'discovered' THEN 'scored' ELSE crm_stage END "
-            "WHERE url = ?",
-            (
-                r["score"],
-                f"{r['keywords']}\n{r['reasoning']}",
-                now,
-                r.get("score_breakdown"),
-                r.get("ats_coverage_pct"),
-                r["url"],
-            ),
-        )
-    conn.commit()
+    score_pool = (
+        ThreadPoolExecutor(max_workers=min(workers, batch_size), thread_name_prefix="applypilot-score")
+        if workers > 1
+        else None
+    )
+    try:
+        while completed_count < target_count:
+            fetch_size = min(batch_size, target_count - completed_count)
+            query = (
+                "SELECT rowid AS _scoring_rowid, url, title, company, site, location, description, full_description "
+                "FROM jobs WHERE rowid > ? AND rowid <= ? AND "
+                f"{conditions} ORDER BY rowid LIMIT ?"
+            )
+            rows = conn.execute(query, (last_rowid, max_rowid, fetch_size)).fetchall()
+            if not rows:
+                break
 
-    elapsed = time.time() - t0
+            batch_jobs: list[dict[str, Any]] = []
+            for row in rows:
+                job_item = dict(row)
+                rowid = int(job_item.pop("_scoring_rowid"))
+                last_rowid = max(last_rowid, rowid)
+                batch_jobs.append(job_item)
+
+            batch_results: list[dict[str, Any]] = []
+            if score_pool is not None and len(batch_jobs) > 1:
+                future_to_job = {score_pool.submit(_score_one, job): job for job in batch_jobs}
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    try:
+                        _, result = future.result()
+                    except Exception as exc:
+                        log.exception("Scoring worker crashed for job %r", job.get("url"))
+                        result = {"score": 0, "keywords": "", "reasoning": f"Scoring worker error: {exc}"}
+                    completed_count += 1
+                    if result["score"] == 0:
+                        errors += 1
+                    else:
+                        batch_results.append(result)
+                    log.info(
+                        "[%d/%d] score=%d (ATS=%d%%)  %s",
+                        completed_count,
+                        target_count,
+                        result["score"],
+                        result.get("ats_coverage_pct", 0),
+                        (job.get("title") or "?")[:60],
+                    )
+            else:
+                for job in batch_jobs:
+                    _, result = _score_one(job)
+                    completed_count += 1
+                    if result["score"] == 0:
+                        errors += 1
+                    else:
+                        batch_results.append(result)
+                    log.info(
+                        "[%d/%d] score=%d (ATS=%d%%)  %s",
+                        completed_count,
+                        target_count,
+                        result["score"],
+                        result.get("ats_coverage_pct", 0),
+                        (job.get("title") or "?")[:60],
+                    )
+
+            # Persist each completed batch; failures remain eligible for a later run.
+            now = datetime.now(UTC).isoformat()
+            for result in batch_results:
+                conn.execute(
+                    "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
+                    "score_breakdown = ?, ats_coverage_pct = COALESCE(ats_coverage_pct, ?), "
+                    "crm_stage = CASE WHEN crm_stage IS NULL OR crm_stage = 'discovered' THEN 'scored' ELSE crm_stage END "
+                    "WHERE url = ?",
+                    (
+                        result["score"],
+                        f"{result.get('keywords', '')}\n{result['reasoning']}",
+                        now,
+                        result.get("score_breakdown"),
+                        result.get("ats_coverage_pct"),
+                        result["url"],
+                    ),
+                )
+            conn.commit()
+            scored_count += len(batch_results)
+            del batch_jobs, batch_results, rows
+
+    finally:
+        if score_pool is not None:
+            score_pool.shutdown(wait=True, cancel_futures=True)
+
+    elapsed = time.perf_counter() - started
     log.info(
         "Done: %d scored, %d errors in %.1fs (%.1f jobs/sec)",
-        len(results), errors, elapsed, len(jobs) / elapsed if elapsed > 0 else 0,
+        scored_count,
+        errors,
+        elapsed,
+        completed_count / elapsed if elapsed > 0 else 0,
     )
 
     dist = conn.execute("""
@@ -295,7 +293,7 @@ def run_scoring(limit: int = 0, rescore: bool = False, workers: int = 1) -> dict
     distribution = [(row[0], row[1]) for row in dist]
 
     return {
-        "scored": len(results),
+        "scored": scored_count,
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,

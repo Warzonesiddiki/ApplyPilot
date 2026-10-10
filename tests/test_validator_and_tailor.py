@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from applypilot.scoring.tailor import (
     _build_file_prefix,
@@ -19,9 +20,12 @@ from applypilot.scoring.validator import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_template(filename: str) -> dict:
+def _load_template(filename: str) -> dict[str, Any]:
     path = REPO_ROOT / "docs" / "profiles" / filename
-    return json.loads(path.read_text(encoding="utf-8"))
+    data: Any = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Profile template must contain a JSON object: {path}")
+    return data
 
 
 def _load_resume_txt(filename: str) -> str:

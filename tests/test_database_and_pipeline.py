@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from applypilot import config, database, pipeline
+import pytest
+
+import applypilot.config as config
+import applypilot.database as database
+import applypilot.pipeline as pipeline
 
 
-def test_database_schema_and_profile_switching(tmp_path: Path, monkeypatch) -> None:
+def test_database_schema_and_profile_switching(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Database initializes with company and pdf_generated_at columns and switches per profile."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
 
@@ -59,7 +63,7 @@ def test_database_schema_and_profile_switching(tmp_path: Path, monkeypatch) -> N
     config.set_active_profile(None)
 
 
-def test_pipeline_pdf_pending_sql_terminates(tmp_path: Path, monkeypatch) -> None:
+def test_pipeline_pdf_pending_sql_terminates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_PENDING_SQL['pdf'] returns 0 once pdf_generated_at is set, preventing infinite stream loops."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     config.set_active_profile(None)

@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 import zipfile
 
+import pytest
+
 from applypilot import config, database
 from applypilot.scoring.ats import compute_ats_coverage, extract_jd_keywords
 from applypilot.scoring.docx_export import batch_convert_docx, convert_to_docx
@@ -42,14 +44,16 @@ def test_ats_keyword_coverage_computes_delta_improvement() -> None:
 
 def test_parse_score_response_with_4d_subscores() -> None:
     """_parse_score_response parses overall score, 4 sub-scores, matched and missing keywords."""
-    raw = """SCORE: 9
-SKILLS_SCORE: 9
-QUALIFICATIONS_SCORE: 10
-DOMAIN_SCORE: 9
-LOCATION_SCORE: 8
-KEYWORDS: ACA, IFRS 15, Statutory Audit, SAP, FP&A
-MISSING_KEYWORDS: Anaplan
-REASONING: Candidate is an ACA Chartered Accountant with direct KPMG and Grant Thornton audit and FP&A experience."""
+    raw = """{
+        "score": 9,
+        "skills_score": 9,
+        "qualifications_score": 10,
+        "domain_score": 9,
+        "location_score": 8,
+        "keywords": ["ACA", "IFRS 15", "Statutory Audit", "SAP", "FP&A"],
+        "missing_keywords": ["Anaplan"],
+        "reasoning": "Candidate is an ACA Chartered Accountant with direct KPMG and Grant Thornton audit and FP&A experience."
+    }"""
 
     parsed = _parse_score_response(raw)
     assert parsed["score"] == 9
@@ -61,7 +65,10 @@ REASONING: Candidate is an ACA Chartered Accountant with direct KPMG and Grant T
     assert parsed["missing_keywords"] == "Anaplan"
 
 
-def test_docx_export_for_resume_and_cover_letter_and_importer(tmp_path: Path, monkeypatch) -> None:
+def test_docx_export_for_resume_and_cover_letter_and_importer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """convert_to_docx produces valid OpenXML .docx files that can be re-imported by importer.py."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     config.set_active_profile("tahir")

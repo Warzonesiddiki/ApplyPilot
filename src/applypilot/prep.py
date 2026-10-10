@@ -14,10 +14,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import sqlite3
+from typing import Any
 
 from applypilot import config
 from applypilot.database import ensure_columns, get_connection
-from applypilot.scoring.ats import compute_ats_coverage
+from applypilot.scoring.ats import ATSCoverageResult, compute_ats_coverage
 from applypilot.scoring.tailor import _build_file_prefix
 from applypilot.scoring.validator import detect_profile_domain
 
@@ -27,7 +28,7 @@ log = logging.getLogger(__name__)
 def find_target_job(
     conn: sqlite3.Connection | None = None,
     url_or_query: str | None = None,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Resolve a target job by URL, title/company substring, or highest fit_score."""
     if conn is None:
         conn = get_connection()
@@ -57,9 +58,9 @@ def find_target_job(
 
 
 def _build_deterministic_prep_markdown(
-    job: dict,
-    profile: dict,
-    ats: dict,
+    job: dict[str, Any],
+    profile: dict[str, Any],
+    ats: ATSCoverageResult,
 ) -> str:
     """Build a structured, fact-grounded Interview Prep Dossier."""
     domain = detect_profile_domain(profile)
@@ -253,8 +254,8 @@ def _build_deterministic_prep_markdown(
 
 
 def generate_interview_prep(
-    job: dict,
-    profile: dict | None = None,
+    job: dict[str, Any],
+    profile: dict[str, Any] | None = None,
     resume_text: str | None = None,
     use_llm: bool = True,
 ) -> tuple[str, Path]:
@@ -317,8 +318,8 @@ def generate_interview_prep(
 
 
 def generate_outreach_pack(
-    job: dict,
-    profile: dict | None = None,
+    job: dict[str, Any],
+    profile: dict[str, Any] | None = None,
     resume_text: str | None = None,
     use_llm: bool = True,
 ) -> tuple[str, Path]:

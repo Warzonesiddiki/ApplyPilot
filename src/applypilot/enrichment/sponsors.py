@@ -9,6 +9,7 @@ Also classifies work arrangement (remote / hybrid / onsite) and detects expired 
 from __future__ import annotations
 
 import re
+from typing import TypedDict
 
 # Curated registry of verified UK Home Office Skilled Worker & EU Recognized Sponsors
 # (normalized lowercase substrings).
@@ -64,7 +65,7 @@ LICENSED_UK_EU_SPONSORS: tuple[str, ...] = (
     "ryanair", "crh", "flutter", "entain", "thomson reuters", "finnet",
 )
 
-_NO_SPONSORSHIP_PATTERNS: tuple[re.Pattern, ...] = tuple(
+_NO_SPONSORSHIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"\b(?:no|not|cannot|unable\s+to|do\s+not|does\s+not|doesn't|won't)\s+(?:offer|provide|support|consider)\s+(?:visa\s+)?sponsorship\b",
@@ -79,7 +80,7 @@ _NO_SPONSORSHIP_PATTERNS: tuple[re.Pattern, ...] = tuple(
     )
 )
 
-_SPONSORSHIP_OFFERED_PATTERNS: tuple[re.Pattern, ...] = tuple(
+_SPONSORSHIP_OFFERED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"\bvisa\s+sponsorship\s+(?:is\s+)?(?:available|offered|provided|supported)\b",
@@ -93,7 +94,7 @@ _SPONSORSHIP_OFFERED_PATTERNS: tuple[re.Pattern, ...] = tuple(
     )
 )
 
-_EXPIRED_PATTERNS: tuple[re.Pattern, ...] = tuple(
+_EXPIRED_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"\bthis\s+job\s+is\s+no\s+longer\s+(?:available|accepting\s+applications|open)\b",
@@ -105,7 +106,7 @@ _EXPIRED_PATTERNS: tuple[re.Pattern, ...] = tuple(
     )
 )
 
-_QUALIFICATION_PATTERNS: list[tuple[str, re.Pattern]] = [
+_QUALIFICATION_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("ACA", re.compile(r"\b(?:ACA|ICAEW)\b")),
     ("ACCA", re.compile(r"\bACCA\b")),
     ("CIMA", re.compile(r"\bCIMA\b")),
@@ -200,12 +201,19 @@ def extract_qualifications(description: str | None) -> list[str]:
     return found
 
 
+class SponsorshipMetadata(TypedDict):
+    sponsor_status: str
+    work_arrangement: str
+    is_expired: bool
+    qualifications: list[str]
+
+
 def evaluate_sponsorship_and_metadata(
     company: str | None,
     title: str | None = None,
     description: str | None = None,
     location: str | None = None,
-) -> dict:
+) -> SponsorshipMetadata:
     """Evaluate sponsor status, work arrangement, expiration, and qualifications."""
     return {
         "sponsor_status": detect_sponsor_status(company, title, description, location),

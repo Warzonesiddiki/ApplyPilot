@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from rich.console import Group
 from rich.panel import Panel
@@ -55,7 +56,7 @@ def init_worker(worker_id: int = 0) -> None:
         _worker_states[worker_id] = WorkerState(worker_id=worker_id)
 
 
-def update_state(worker_id: int = 0, **kwargs) -> None:
+def update_state(worker_id: int = 0, **kwargs: Any) -> None:
     """Update the worker's state fields.
 
     Args:

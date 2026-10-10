@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from applypilot import config
+import pytest
+
+import applypilot.config as config
 
 
-def test_profile_switching_and_isolation(tmp_path: Path, monkeypatch) -> None:
+def test_profile_switching_and_isolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each profile slug resolves to an isolated workspace directory."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
 

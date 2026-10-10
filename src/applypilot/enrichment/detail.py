@@ -16,27 +16,39 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Iterator
 from datetime import UTC, datetime
+from threading import Event, Lock
+from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Page, Response, sync_playwright
 
+from applypilot.browser import install_dom_scraping_routes
 from applypilot.database import close_connection, init_db
 from applypilot.llm import get_client
+from applypilot.schemas import JobDescriptionResponse
 
 log = logging.getLogger(__name__)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_DETAIL_DB_BATCH_SIZE = 500
+_MAX_DETAIL_SITE_WORKERS = 8
+_URL_RESOLUTION_BATCH_SIZE = 500
+_DETAIL_JSON_LD_MAX_DOCUMENTS = 16
+_DETAIL_JSON_LD_MAX_DOCUMENT_CHARS = 256_000
+_DETAIL_JSON_LD_MAX_TOTAL_CHARS = 1_000_000
+_WTTJ_RESPONSE_MAX_CHARS = 8_000_000
 
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
 
 # Module-level proxy config (set from CLI or caller)
-_PROXY_CONFIG: dict | None = None
+_PROXY_CONFIG: dict[str, Any] | None = None
 
 
-def set_proxy(proxy_str: str | None):
+def set_proxy(proxy_str: str | None) -> None:
     """Set proxy config from an external caller."""
     global _PROXY_CONFIG
     if proxy_str:
@@ -79,98 +91,164 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     return urljoin(base, raw_url)
 
 
-def resolve_all_urls(conn: sqlite3.Connection) -> dict:
-    """Resolve all relative URLs in the database. Returns stats."""
-    rows = conn.execute("SELECT url, site FROM jobs").fetchall()
+def resolve_all_urls(conn: sqlite3.Connection) -> dict[str, int]:
+    """Resolve stored relative URLs in bounded rowid batches."""
+    max_row = conn.execute("SELECT MAX(rowid) FROM jobs").fetchone()
+    max_rowid = int(max_row[0]) if max_row is not None and max_row[0] is not None else 0
     resolved = 0
     failed = 0
     already_absolute = 0
+    last_rowid = 0
 
-    for row in rows:
-        url, site = row[0], row[1]
-        if url.startswith("http://") or url.startswith("https://"):
-            already_absolute += 1
-            continue
+    while last_rowid < max_rowid:
+        rows = conn.execute(
+            "SELECT rowid, url, site FROM jobs WHERE rowid > ? AND rowid <= ? "
+            "ORDER BY rowid LIMIT ?",
+            (last_rowid, max_rowid, _URL_RESOLUTION_BATCH_SIZE),
+        ).fetchall()
+        if not rows:
+            break
+        last_rowid = int(rows[-1][0])
+        for row in rows:
+            url, site = row[1], row[2]
+            if url.startswith("http://") or url.startswith("https://"):
+                already_absolute += 1
+                continue
 
-        new_url = resolve_url(url, site)
-        if new_url and new_url != url:
-            try:
-                conn.execute("UPDATE jobs SET url = ? WHERE url = ?", (new_url, url))
-                resolved += 1
-            except sqlite3.IntegrityError:
-                conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
-                resolved += 1
-        else:
-            failed += 1
+            new_url = resolve_url(url, site)
+            if new_url and new_url != url:
+                try:
+                    conn.execute("UPDATE jobs SET url = ? WHERE url = ?", (new_url, url))
+                    resolved += 1
+                except sqlite3.IntegrityError:
+                    conn.execute("DELETE FROM jobs WHERE url = ?", (url,))
+                    resolved += 1
+            else:
+                failed += 1
 
-    # Also resolve relative application_urls
+    # Also resolve relative application_urls without loading all remaining jobs.
     app_resolved = 0
-    rows = conn.execute(
-        "SELECT url, site, application_url FROM jobs "
-        "WHERE application_url IS NOT NULL AND application_url != '' "
-        "AND application_url NOT LIKE 'http%'"
-    ).fetchall()
-    for row in rows:
-        url, site, app_url = row[0], row[1], row[2]
-        new_app = resolve_url(app_url, site)
-        if new_app and new_app != app_url:
-            conn.execute("UPDATE jobs SET application_url = ? WHERE url = ?", (new_app, url))
-            app_resolved += 1
+    last_rowid = 0
+    while last_rowid < max_rowid:
+        rows = conn.execute(
+            "SELECT rowid, url, site, application_url FROM jobs "
+            "WHERE rowid > ? AND rowid <= ? AND application_url IS NOT NULL "
+            "AND application_url != '' AND application_url NOT LIKE 'http%' "
+            "ORDER BY rowid LIMIT ?",
+            (last_rowid, max_rowid, _URL_RESOLUTION_BATCH_SIZE),
+        ).fetchall()
+        if not rows:
+            break
+        last_rowid = int(rows[-1][0])
+        for row in rows:
+            url, site, app_url = row[1], row[2], row[3]
+            new_app = resolve_url(app_url, site)
+            if new_app and new_app != app_url:
+                conn.execute("UPDATE jobs SET application_url = ? WHERE url = ?", (new_app, url))
+                app_resolved += 1
 
     conn.commit()
-    return {"resolved": resolved, "failed": failed, "already_absolute": already_absolute,
-            "app_resolved": app_resolved}
+    return {
+        "resolved": resolved,
+        "failed": failed,
+        "already_absolute": already_absolute,
+        "app_resolved": app_resolved,
+    }
 
 
 def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
     """Re-fetch WTTJ Algolia API to get proper detail URLs and fix slug-as-title.
     Returns count of URLs updated."""
-    wttj_jobs = conn.execute(
-        "SELECT url, title FROM jobs WHERE site = 'WelcomeToTheJungle'"
-    ).fetchall()
-
-    if not wttj_jobs:
+    wttj_count_row = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE site = 'WelcomeToTheJungle'"
+    ).fetchone()
+    if wttj_count_row is None or int(wttj_count_row[0]) == 0:
         return 0
+    max_row = conn.execute(
+        "SELECT MAX(rowid) FROM jobs WHERE site = 'WelcomeToTheJungle'"
+    ).fetchone()
+    max_rowid = int(max_row[0]) if max_row is not None and max_row[0] is not None else 0
 
-    algolia_data: dict = {}
+    algolia_data: dict[str, Any] = {}
 
-    def capture_algolia(response):
-        if "algolia.net" in response.url and "/queries" in response.url:
+    def capture_algolia(response: Response) -> None:
+        if "algolia.net" not in response.url or "/queries" not in response.url:
+            return
+        content_length = response.headers.get("content-length")
+        if content_length:
             try:
-                algolia_data["response"] = json.loads(response.text())
-            except Exception:
-                pass
+                if int(content_length) > _WTTJ_RESPONSE_MAX_CHARS:
+                    return
+            except ValueError:
+                return
+        try:
+            response_text = response.text()
+            if len(response_text) <= _WTTJ_RESPONSE_MAX_CHARS:
+                algolia_data["response"] = json.loads(response_text)
+        except Exception:
+            return
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=UA)
-        page.on("response", capture_algolia)
-        page.goto(
-            "https://www.welcometothejungle.com/en/jobs?query=developer&refinementList%5Bremote%5D%5B%5D=fulltime",
-            timeout=60000,
-        )
-        page.wait_for_load_state("networkidle")
-        browser.close()
+        context = None
+        page = None
+        try:
+            context = browser.new_context(user_agent=UA)
+            install_dom_scraping_routes(context)
+            page = context.new_page()
+            page.on("response", capture_algolia)
+            page.goto(
+                "https://www.welcometothejungle.com/en/jobs?query=developer&refinementList%5Bremote%5D%5B%5D=fulltime",
+                timeout=60000,
+            )
+            page.wait_for_load_state("networkidle")
+        finally:
+            if page is not None:
+                page.close()
+            if context is not None:
+                context.close()
+            browser.close()
 
     if not algolia_data.get("response"):
         log.warning("WTTJ: No Algolia response captured")
         return 0
 
-    results = algolia_data["response"].get("results", [])
-    slug_map: dict = {}
-    for rs in results:
-        for hit in rs.get("hits", []):
-            slug = hit.get("slug", "")
-            org = hit.get("organization", {})
-            org_slug = org.get("slug", "") if isinstance(org, dict) else ""
-            name = hit.get("name", "")
-            if slug and org_slug:
-                detail_url = f"https://www.welcometothejungle.com/en/companies/{org_slug}/jobs/{slug}"
-                slug_map[slug] = {"url": detail_url, "name": name}
+    response_data = algolia_data.get("response")
+    if not isinstance(response_data, dict):
+        log.warning("WTTJ: Algolia response was not a JSON object")
+        return 0
+    results = response_data.get("results", [])
+    if not isinstance(results, list):
+        log.warning("WTTJ: Algolia results were not a list")
+        return 0
 
-    updated = 0
-    for row in wttj_jobs:
-        old_url, old_title = row[0], row[1]
+    def _build_slug_map(results_list: list[Any]) -> dict[str, dict[str, str]]:
+        slug_results: dict[str, dict[str, str]] = {}
+        for result in results_list:
+            if not isinstance(result, dict):
+                continue
+            hits = result.get("hits", [])
+            if not isinstance(hits, list):
+                continue
+            for hit in hits:
+                if not isinstance(hit, dict):
+                    continue
+                slug = str(hit.get("slug") or "")
+                organization = hit.get("organization", {})
+                org_slug = str(organization.get("slug") or "") if isinstance(organization, dict) else ""
+                name = str(hit.get("name") or "")
+                if slug and org_slug:
+                    detail_url = f"https://www.welcometothejungle.com/en/companies/{org_slug}/jobs/{slug}"
+                    slug_results[slug] = {"url": detail_url, "name": name}
+        return slug_results
+
+    slug_map = _build_slug_map(results)
+    response_data.clear()
+    algolia_data.clear()
+    del results
+    del response_data
+
+    def _update_wttj_job(old_url: str, old_title: str) -> bool:
         slug = old_url.split("_DFNS_")[0] if "_DFNS_" in old_url else old_url
         match = slug_map.get(slug) or slug_map.get(old_url)
         if match:
@@ -179,23 +257,37 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
                     "UPDATE jobs SET url = ?, title = ? WHERE url = ?",
                     (match["url"], match["name"] or old_title, old_url),
                 )
-                updated += 1
             except sqlite3.IntegrityError:
                 conn.execute("DELETE FROM jobs WHERE url = ?", (old_url,))
+            return True
+
+        for candidate_slug, data in slug_map.items():
+            if candidate_slug in old_url or old_url in candidate_slug:
+                try:
+                    conn.execute(
+                        "UPDATE jobs SET url = ?, title = ? WHERE url = ?",
+                        (data["url"], data["name"] or old_title, old_url),
+                    )
+                except sqlite3.IntegrityError:
+                    conn.execute("DELETE FROM jobs WHERE url = ?", (old_url,))
+                return True
+        return False
+
+    updated = 0
+    last_rowid = 0
+    while last_rowid < max_rowid:
+        wttj_rows = conn.execute(
+            "SELECT rowid, url, title FROM jobs "
+            "WHERE site = 'WelcomeToTheJungle' AND rowid > ? AND rowid <= ? "
+            "ORDER BY rowid LIMIT ?",
+            (last_rowid, max_rowid, _URL_RESOLUTION_BATCH_SIZE),
+        ).fetchall()
+        if not wttj_rows:
+            break
+        last_rowid = int(wttj_rows[-1][0])
+        for row in wttj_rows:
+            if _update_wttj_job(str(row[1]), str(row[2] or "")):
                 updated += 1
-        else:
-            for s, data in slug_map.items():
-                if s in old_url or old_url in s:
-                    try:
-                        conn.execute(
-                            "UPDATE jobs SET url = ?, title = ? WHERE url = ?",
-                            (data["url"], data["name"] or old_title, old_url),
-                        )
-                        updated += 1
-                    except sqlite3.IntegrityError:
-                        conn.execute("DELETE FROM jobs WHERE url = ?", (old_url,))
-                        updated += 1
-                    break
 
     conn.commit()
     return updated
@@ -203,30 +295,44 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
 
 # -- Detail page intelligence ------------------------------------------------
 
-def collect_detail_intelligence(page) -> dict:
-    """Collect signals from a detail page. Lighter than discovery -- no API interception."""
-    intel: dict = {"json_ld": [], "page_title": "", "final_url": ""}
+def collect_detail_intelligence(page: Page) -> dict[str, Any]:
+    """Collect bounded JSON-LD signals from a detail page without API interception."""
+    intel: dict[str, Any] = {"json_ld": [], "page_title": "", "final_url": ""}
 
     intel["page_title"] = page.title()
     intel["final_url"] = page.url
+    scripts = page.locator('script[type="application/ld+json"]')
+    script_count = min(scripts.count(), _DETAIL_JSON_LD_MAX_DOCUMENTS)
+    total_chars = 0
 
-    for el in page.query_selector_all('script[type="application/ld+json"]'):
+    for index in range(script_count):
+        remaining_chars = _DETAIL_JSON_LD_MAX_TOTAL_CHARS - total_chars
+        if remaining_chars <= 0:
+            break
+        max_chars = min(_DETAIL_JSON_LD_MAX_DOCUMENT_CHARS, remaining_chars)
         try:
-            data = json.loads(el.inner_text())
+            text = scripts.nth(index).evaluate(
+                "(element, limit) => String(element.textContent || '').slice(0, limit + 1)",
+                max_chars,
+            )
+            if not isinstance(text, str) or len(text) > max_chars:
+                continue
+            data = json.loads(text)
             intel["json_ld"].append(data)
+            total_chars += len(text)
         except Exception:
-            pass
+            continue
 
     return intel
 
 
 # -- Tier 1: JSON-LD extraction -----------------------------------------------
 
-def extract_from_json_ld(intel: dict) -> dict | None:
+def extract_from_json_ld(intel: dict[str, Any]) -> dict[str, Any] | None:
     """Extract description and apply URL from JSON-LD JobPosting.
     Returns {"full_description": str, "application_url": str|None} or None."""
 
-    def find_job_posting(data):
+    def find_job_posting(data: Any) -> dict[str, Any] | None:
         if isinstance(data, dict):
             if data.get("@type") == "JobPosting":
                 return data
@@ -331,7 +437,7 @@ DESCRIPTION_SELECTORS = [
 ]
 
 
-def extract_apply_url_deterministic(page) -> str | None:
+def extract_apply_url_deterministic(page: Page) -> str | None:
     """Try known CSS patterns for apply buttons/links."""
     for sel in APPLY_SELECTORS:
         try:
@@ -343,7 +449,7 @@ def extract_apply_url_deterministic(page) -> str | None:
                 tag = el.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "button":
                     parent_href = el.evaluate("el => el.parentElement?.querySelector('a')?.href || null")
-                    if parent_href:
+                    if isinstance(parent_href, str) and parent_href:
                         return parent_href
                     return page.url
         except Exception:
@@ -363,7 +469,7 @@ def extract_apply_url_deterministic(page) -> str | None:
     return None
 
 
-def extract_description_deterministic(page) -> str | None:
+def extract_description_deterministic(page: Page) -> str | None:
     """Try known CSS patterns for the job description block."""
     for sel in DESCRIPTION_SELECTORS:
         try:
@@ -403,7 +509,7 @@ HTML:
 {content}"""
 
 
-def extract_main_content(page) -> str:
+def extract_main_content(page: Page) -> str:
     """Extract the main content area, stripped of navigation noise."""
     for sel in ["main", "article", '[role="main"]', "#content", ".content"]:
         try:
@@ -438,7 +544,7 @@ def clean_content_html(html: str) -> str:
         tag.decompose()
 
     for tag in soup.find_all(True):
-        new_attrs: dict = {}
+        new_attrs: dict[str, Any] = {}
         for attr, val in list(tag.attrs.items()):
             if attr in ("id", "href", "class", "role", "aria-label", "data-testid", "name", "for", "type"):
                 if attr == "class":
@@ -455,7 +561,7 @@ def clean_content_html(html: str) -> str:
     return str(soup)
 
 
-def extract_with_llm(page, url: str) -> dict:
+def extract_with_llm(page: Page, url: str) -> dict[str, Any]:
     """Send focused HTML to LLM for extraction. Fallback tier."""
     content = extract_main_content(page)
     if not content:
@@ -476,19 +582,16 @@ def extract_with_llm(page, url: str) -> dict:
     try:
         client = get_client()
         t0 = time.time()
-        raw = client.ask(prompt, temperature=0.0, max_tokens=4096)
+        result = client.ask_structured(
+            prompt,
+            response_model=JobDescriptionResponse,
+            temperature=0.0,
+            max_tokens=4096,
+        )
         elapsed = time.time() - t0
         log.info("LLM: %d chars in, %.1fs", len(prompt), elapsed)
-
-        from applypilot.discovery.smartextract import extract_json
-        result = extract_json(raw)
-        desc = result.get("full_description")
-        apply_url = result.get("application_url")
-
-        if desc:
-            desc = clean_description(desc)
-
-        return {"full_description": desc, "application_url": apply_url}
+        description = clean_description(result.full_description) if result.full_description else None
+        return {"full_description": description, "application_url": result.application_url}
     except Exception as e:
         log.error("LLM ERROR: %s", e)
         return {"full_description": None, "application_url": None}
@@ -539,9 +642,9 @@ RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
 
-def scrape_detail_page(page, url: str) -> dict:
+def scrape_detail_page(page: Page, url: str) -> dict[str, Any]:
     """Full cascade for one detail page."""
-    result: dict = {
+    result: dict[str, Any] = {
         "full_description": None,
         "application_url": None,
         "status": "error",
@@ -620,117 +723,157 @@ def scrape_detail_page(page, url: str) -> dict:
 def scrape_site_batch(
     conn: sqlite3.Connection | None,
     site: str,
-    jobs: list[tuple],
+    jobs: list[tuple[str, str]],
     delay: float = 2.0,
     max_jobs: int | None = None,
-) -> dict:
-    """Process all jobs for one site using shared browser context.
+) -> dict[str, Any]:
+    """Scrape one site's listings with a pooled context and guaranteed teardown.
 
-    If conn is None, creates its own DB connection.
+    A context is recycled every 50 navigations to bound browser memory and
+    cookie/cache growth. Images, fonts, stylesheets, media, and analytics are
+    routed away because extraction depends on text and DOM structure only.
     """
-    stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
-
-    if max_jobs:
-        jobs = jobs[:max_jobs]
-
-    if not jobs:
+    stats: dict[str, Any] = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    selected_jobs = jobs[:max_jobs] if max_jobs else jobs
+    if not selected_jobs:
         return stats
 
     own_conn = conn is None
-    if own_conn:
-        conn = init_db()
-
+    database_conn = conn if conn is not None else init_db()
     now = datetime.now(UTC).isoformat()
 
     try:
-        with sync_playwright() as p:
-            launch_opts: dict = {"headless": True}
+        with sync_playwright() as playwright:
+            launch_options: dict[str, Any] = {"headless": True}
             if _PROXY_CONFIG:
-                launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
-            browser = p.chromium.launch(**launch_opts)
-            context = browser.new_context(user_agent=UA)
-            page = context.new_page()
+                launch_options["proxy"] = _PROXY_CONFIG["playwright"]
+            browser = playwright.chromium.launch(**launch_options)
+            context = None
+            page = None
+            try:
+                context = browser.new_context(user_agent=UA)
+                install_dom_scraping_routes(context)
+                page = context.new_page()
 
-            for i, (url, title) in enumerate(jobs):
-                log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
+                for index, (url, title) in enumerate(selected_jobs):
+                    log.info("[%d/%d] %s", index + 1, len(selected_jobs), title[:50] if title else url[:50])
+                    try:
+                        result = scrape_detail_page(page, url)
+                    except Exception as exc:
+                        log.exception("Detail scrape failed for %s", url)
+                        result = {"status": "error", "error": str(exc)[:200], "elapsed": 0.0}
 
-                result = scrape_detail_page(page, url)
-                stats["processed"] += 1
+                    stats["processed"] += 1
+                    tier = result.get("tier_used")
+                    status = str(result.get("status", "error"))
+                    elapsed = float(result.get("elapsed", 0.0))
+                    if tier:
+                        stats["tiers"][tier] = stats["tiers"].get(tier, 0) + 1
 
-                tier = result.get("tier_used")
-                status = result["status"]
-                elapsed = result.get("elapsed", 0)
-
-                if tier:
-                    stats["tiers"][tier] = stats["tiers"].get(tier, 0) + 1
-
-                tier_str = f"T{tier}" if tier else "--"
-                desc_len = len(result.get("full_description") or "")
-                apply_str = "yes" if result.get("application_url") else "no"
-                err_str = f" | err={result.get('error')}" if result.get("error") else ""
-
-                log.info("  %s | %s | desc=%s chars | apply=%s | %.1fs%s",
-                         status, tier_str, f"{desc_len:,}", apply_str, elapsed, err_str)
-
-                if status in ("ok", "partial"):
-                    stats[status] += 1
-                    from applypilot.enrichment.sponsors import evaluate_sponsorship_and_metadata
-
-                    row_meta = conn.execute(
-                        "SELECT company, location FROM jobs WHERE url = ?", (url,)
-                    ).fetchone()
-                    comp_name = (row_meta[0] if row_meta else None) or site
-                    loc_name = row_meta[1] if row_meta else None
-                    meta = evaluate_sponsorship_and_metadata(
-                        comp_name, title, result.get("full_description"), loc_name
+                    desc_len = len(result.get("full_description") or "")
+                    err_str = f" | err={result['error']}" if result.get("error") else ""
+                    log.info(
+                        "  %s | %s | desc=%s chars | apply=%s | %.1fs%s",
+                        status,
+                        f"T{tier}" if tier else "--",
+                        f"{desc_len:,}",
+                        "yes" if result.get("application_url") else "no",
+                        elapsed,
+                        err_str,
                     )
-                    if meta["is_expired"]:
-                        conn.execute(
-                            "UPDATE jobs SET full_description = ?, application_url = ?, "
-                            "detail_scraped_at = ?, detail_error = 'expired_listing', "
-                            "apply_status = 'expired', crm_stage = 'rejected', "
-                            "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
-                            (
-                                result.get("full_description"),
-                                result.get("application_url"),
-                                now,
-                                meta["sponsor_status"],
-                                meta["work_arrangement"],
-                                url,
-                            ),
+
+                    if status in ("ok", "partial"):
+                        stats[status] += 1
+                        from applypilot.enrichment.sponsors import evaluate_sponsorship_and_metadata
+
+                        row_meta = database_conn.execute(
+                            "SELECT company, location FROM jobs WHERE url = ?", (url,)
+                        ).fetchone()
+                        company = (row_meta[0] if row_meta else None) or site
+                        location = row_meta[1] if row_meta else None
+                        metadata = evaluate_sponsorship_and_metadata(
+                            company, title, result.get("full_description"), location
                         )
+                        if metadata["is_expired"]:
+                            database_conn.execute(
+                                "UPDATE jobs SET full_description = ?, application_url = ?, "
+                                "detail_scraped_at = ?, detail_error = 'expired_listing', "
+                                "apply_status = 'expired', crm_stage = 'rejected', "
+                                "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
+                                (
+                                    result.get("full_description"), result.get("application_url"), now,
+                                    metadata["sponsor_status"], metadata["work_arrangement"], url,
+                                ),
+                            )
+                        else:
+                            database_conn.execute(
+                                "UPDATE jobs SET full_description = ?, application_url = ?, "
+                                "detail_scraped_at = ?, detail_error = NULL, "
+                                "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
+                                (
+                                    result.get("full_description"), result.get("application_url"), now,
+                                    metadata["sponsor_status"], metadata["work_arrangement"], url,
+                                ),
+                            )
                     else:
-                        conn.execute(
-                            "UPDATE jobs SET full_description = ?, application_url = ?, "
-                            "detail_scraped_at = ?, detail_error = NULL, "
-                            "sponsor_status = ?, work_arrangement = ? WHERE url = ?",
-                            (
-                                result.get("full_description"),
-                                result.get("application_url"),
-                                now,
-                                meta["sponsor_status"],
-                                meta["work_arrangement"],
-                                url,
-                            ),
+                        stats["error"] += 1
+                        database_conn.execute(
+                            "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
+                            (result.get("error", "unknown"), now, url),
                         )
-                else:
-                    stats["error"] += 1
-                    conn.execute(
-                        "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
-                        (result.get("error", "unknown"), now, url),
-                    )
+                    database_conn.commit()
 
-                conn.commit()
-
-                if i < len(jobs) - 1:
-                    time.sleep(delay)
-
-            browser.close()
+                    if delay > 0 and index < len(selected_jobs) - 1:
+                        time.sleep(delay)
+                    if (index + 1) % 50 == 0 and index + 1 < len(selected_jobs):
+                        page.close()
+                        context.close()
+                        context = browser.new_context(user_agent=UA)
+                        install_dom_scraping_routes(context)
+                        page = context.new_page()
+            finally:
+                try:
+                    if page is not None:
+                        page.close()
+                finally:
+                    try:
+                        if context is not None:
+                            context.close()
+                    finally:
+                        browser.close()
     finally:
         if own_conn:
             close_connection()
-
     return stats
+
+
+def _iter_pending_site_job_batches(
+    conn: sqlite3.Connection,
+    site: str,
+    max_rowid: int,
+    job_count: int,
+    *,
+    batch_size: int = _DETAIL_DB_BATCH_SIZE,
+) -> Iterator[list[tuple[str, str]]]:
+    """Stream a stable per-site snapshot without materializing every pending row."""
+    last_rowid = 0
+    emitted = 0
+    while emitted < job_count:
+        limit = min(batch_size, job_count - emitted)
+        rows = conn.execute(
+            "SELECT rowid, url, title FROM jobs "
+            "WHERE COALESCE(site, '') = ? AND detail_scraped_at IS NULL AND rowid > ? AND rowid <= ? "
+            "ORDER BY rowid LIMIT ?",
+            (site, last_rowid, max_rowid, limit),
+        ).fetchall()
+        if not rows:
+            break
+        batch: list[tuple[str, str]] = []
+        for row in rows:
+            last_rowid = int(row[0])
+            batch.append((str(row[1]), str(row[2] or "")))
+        emitted += len(batch)
+        yield batch
 
 
 def _run_detail_scraper(
@@ -738,86 +881,146 @@ def _run_detail_scraper(
     sites: list[str] | None = None,
     max_per_site: int | None = None,
     workers: int = 1,
-) -> dict:
-    """Groups pending jobs by site and processes each batch.
-
-    Sequential by default. When workers > 1, processes multiple site batches
-    in parallel using ThreadPoolExecutor (each thread gets its own browser
-    and DB connection).
-
-    Returns aggregate stats dict.
-    """
-    skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
-    where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
+) -> dict[str, Any]:
+    """Stream bounded job batches per site, optionally scraping sites concurrently."""
+    workers = max(1, min(workers, _MAX_DETAIL_SITE_WORKERS))
+    skipped_sites = tuple(sorted(SKIP_DETAIL_SITES))
+    placeholders = ", ".join("?" for _ in skipped_sites)
     rows = conn.execute(
-        f"SELECT url, title, site FROM jobs {where} ORDER BY site"
+        "SELECT COALESCE(site, '') AS site, COUNT(*), MAX(rowid) FROM jobs "
+        f"WHERE detail_scraped_at IS NULL AND COALESCE(site, '') NOT IN ({placeholders}) "
+        "GROUP BY COALESCE(site, '')",
+        skipped_sites,
     ).fetchall()
-
     if not rows:
         log.info("No pending jobs to scrape.")
         return {"processed": 0, "ok": 0, "partial": 0, "error": 0}
 
-    site_jobs: dict[str, list[tuple]] = {}
-    for row in rows:
-        url, title, site = row[0], row[1], row[2]
-        if sites and site not in sites:
-            continue
-        site_jobs.setdefault(site, []).append((url, title))
-
-    log.info("Pending: %d jobs across %d sites (workers=%d)", len(rows), len(site_jobs), workers)
-    for site, jobs in site_jobs.items():
-        log.info("  %s: %d jobs", site, len(jobs))
+    database_row = conn.execute("PRAGMA database_list").fetchone()
+    database_path = str(database_row[2]) if database_row is not None else ""
+    site_snapshots: dict[str, tuple[int, int]] = {
+        str(row[0] or ""): (int(row[1]), int(row[2])) for row in rows
+    }
+    site_jobs = {
+        site: snapshot
+        for site, snapshot in site_snapshots.items()
+        if not sites or site in sites
+    }
+    log.info(
+        "Pending: %d jobs across %d sites (workers=%d)",
+        sum(count for count, _ in site_snapshots.values()),
+        len(site_jobs),
+        workers,
+    )
 
     known_order = [
         "RemoteOK", "Job Bank Canada", "BuiltIn Remote",
         "WelcomeToTheJungle", "CareerJet Canada", "Hacker News Jobs",
     ]
-    order = [s for s in known_order if s in site_jobs]
-    order += [s for s in sorted(site_jobs.keys()) if s not in order]
+    order = [site for site in known_order if site in site_jobs]
+    order += [site for site in sorted(site_jobs) if site not in order]
 
-    total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
+    total_stats: dict[str, Any] = {
+        "processed": 0,
+        "ok": 0,
+        "partial": 0,
+        "error": 0,
+        "tiers": {1: 0, 2: 0, 3: 0},
+    }
 
-    def _merge_stats(stats: dict) -> None:
-        for k in ("processed", "ok", "partial", "error"):
-            total_stats[k] += stats[k]
-        for t, count in stats["tiers"].items():
-            total_stats["tiers"][t] = total_stats["tiers"].get(t, 0) + count
+    def _merge_stats(target: dict[str, Any], stats: dict[str, Any]) -> None:
+        for key in ("processed", "ok", "partial", "error"):
+            target[key] += stats[key]
+        for tier, count in stats["tiers"].items():
+            target["tiers"][tier] = target["tiers"].get(tier, 0) + count
 
-    if workers > 1 and len(order) > 1:
-        # Parallel mode: each site batch runs in its own thread with its own
-        # DB connection (conn=None tells scrape_site_batch to create one)
-        def _scrape_site(site: str) -> dict:
-            jobs = site_jobs[site]
-            delay = SITE_DELAYS.get(site, 2.0)
-            log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
-            stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
-            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                     site, stats["ok"], stats["partial"], stats["error"],
-                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
-            return stats
+    def _selected_job_count(count: int) -> int:
+        if max_per_site is None or max_per_site == 0:
+            return count
+        if max_per_site > 0:
+            return min(count, max_per_site)
+        return max(0, count + max_per_site)
 
-        with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
-            futures = {pool.submit(_scrape_site, site): site for site in order}
+    def _scrape_site_batches(database_conn: sqlite3.Connection, site: str) -> dict[str, Any]:
+        count, max_rowid = site_jobs[site]
+        selected_count = _selected_job_count(count)
+        delay = SITE_DELAYS.get(site, 2.0)
+        log.info("%s -- %d jobs (delay=%.1fs)", site, selected_count, delay)
+        site_stats: dict[str, Any] = {
+            "processed": 0,
+            "ok": 0,
+            "partial": 0,
+            "error": 0,
+            "tiers": {1: 0, 2: 0, 3: 0},
+        }
+        for batch_index, jobs in enumerate(
+            _iter_pending_site_job_batches(database_conn, site, max_rowid, selected_count),
+            start=1,
+        ):
+            if batch_index > 1 and delay > 0:
+                time.sleep(delay)
+            stats = scrape_site_batch(database_conn, site, jobs, delay=delay)
+            _merge_stats(site_stats, stats)
+        log.info(
+            "%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+            site,
+            site_stats["ok"],
+            site_stats["partial"],
+            site_stats["error"],
+            site_stats["tiers"].get(1, 0),
+            site_stats["tiers"].get(2, 0),
+            site_stats["tiers"].get(3, 0),
+        )
+        return site_stats
+
+    if workers > 1 and len(order) > 1 and database_path:
+        next_site_index = 0
+        site_index_lock = Lock()
+        worker_count = min(workers, len(order))
+
+        def _scrape_site_group_in_worker() -> dict[str, Any]:
+            nonlocal next_site_index
+            worker_conn = init_db(database_path)
+            worker_stats: dict[str, Any] = {
+                "processed": 0,
+                "ok": 0,
+                "partial": 0,
+                "error": 0,
+                "tiers": {1: 0, 2: 0, 3: 0},
+            }
+            try:
+                while True:
+                    with site_index_lock:
+                        if next_site_index >= len(order):
+                            break
+                        site = order[next_site_index]
+                        next_site_index += 1
+                    _merge_stats(worker_stats, _scrape_site_batches(worker_conn, site))
+                return worker_stats
+            finally:
+                close_connection(database_path)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(_scrape_site_group_in_worker) for _ in range(worker_count)]
             for future in as_completed(futures):
-                _merge_stats(future.result())
+                _merge_stats(total_stats, future.result())
     else:
-        # Sequential mode (default)
         for site in order:
-            jobs = site_jobs[site]
-            delay = SITE_DELAYS.get(site, 2.0)
-            log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
+            _merge_stats(total_stats, _scrape_site_batches(conn, site))
 
-            stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
-            _merge_stats(stats)
-
-            log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                     stats["ok"], stats["partial"], stats["error"],
-                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
-
-    log.info("TOTAL: %d processed | %d ok | %d partial | %d error",
-             total_stats["processed"], total_stats["ok"], total_stats["partial"], total_stats["error"])
-    log.info("Tier distribution: T1=%d T2=%d T3=%d",
-             total_stats["tiers"].get(1, 0), total_stats["tiers"].get(2, 0), total_stats["tiers"].get(3, 0))
+    log.info(
+        "TOTAL: %d processed | %d ok | %d partial | %d error",
+        total_stats["processed"],
+        total_stats["ok"],
+        total_stats["partial"],
+        total_stats["error"],
+    )
+    log.info(
+        "Tier distribution: T1=%d T2=%d T3=%d",
+        total_stats["tiers"].get(1, 0),
+        total_stats["tiers"].get(2, 0),
+        total_stats["tiers"].get(3, 0),
+    )
 
     llm_calls = total_stats["tiers"].get(3, 0)
     total = total_stats["processed"]
@@ -827,12 +1030,11 @@ def _run_detail_scraper(
 
     return total_stats
 
-
 # -- Streaming detail scraper (for sequential pipeline) ----------------------
 
 def stream_detail(
-    upstream_done,
-    my_done,
+    upstream_done: Event | None,
+    my_done: Event,
     proxy_str: str | None = None,
     poll_interval: float = 5.0,
 ) -> None:
@@ -859,15 +1061,17 @@ def stream_detail(
 
     try:
         while True:
-            skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
+            skipped_sites = tuple(sorted(SKIP_DETAIL_SITES))
+            placeholders = ", ".join("?" for _ in skipped_sites)
             rows = conn.execute(
                 "SELECT url, title, site FROM jobs "
-                f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
-                "ORDER BY site LIMIT 200"
+                f"WHERE detail_scraped_at IS NULL AND site NOT IN ({placeholders}) "
+                "ORDER BY site LIMIT 200",
+                skipped_sites,
             ).fetchall()
 
             if rows:
-                site_jobs: dict[str, list[tuple]] = {}
+                site_jobs: dict[str, list[tuple[str, str]]] = {}
                 for row in rows:
                     url, title, site = row[0], row[1], row[2]
                     site_jobs.setdefault(site, []).append((url, title))
@@ -900,7 +1104,7 @@ def stream_detail(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
+def run_enrichment(limit: int = 100, workers: int = 1) -> dict[str, Any]:
     """Main entry point for detail page enrichment.
 
     Fetches pending jobs from the database (those without full_description),

@@ -8,25 +8,29 @@ meaning discovered jobs are immediately pre-enriched for scoring.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 import html
 import logging
 import re
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 
 from applypilot import config
 from applypilot.database import close_connection, init_db, store_jobs
 from applypilot.discovery.workday import strip_html
+from applypilot.network import RetryPolicy, build_async_client, request_with_retry
 
 log = logging.getLogger(__name__)
 
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 _TIMEOUT = 20.0
+_MAX_BOARD_CONCURRENCY = 64
+_ATS_PERSIST_BATCH_SIZE = 8
 
 
-def _extract_query_keywords(search_cfg: dict | None = None) -> list[str]:
+def _extract_query_keywords(search_cfg: dict[str, Any] | None = None) -> list[str]:
     """Extract lowercase query keywords/phrases from searches.yaml for client-side filtering."""
     if search_cfg is None:
         if not config.SEARCH_CONFIG_PATH.exists():
@@ -68,16 +72,16 @@ def _matches_queries(title: str | None, keywords: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 def parse_greenhouse_jobs(
-    payload: dict,
+    payload: Any,
     employer_name: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Greenhouse `/v1/boards/{token}/jobs?content=true` JSON response."""
     raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -116,16 +120,16 @@ def parse_greenhouse_jobs(
 
 
 def parse_lever_jobs(
-    payload: list | dict,
+    payload: Any,
     employer_name: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Lever `/v0/postings/{token}?mode=json` JSON response."""
     raw_jobs = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -136,7 +140,8 @@ def parse_lever_jobs(
         if not title or not url:
             continue
 
-        cats = item.get("categories") if isinstance(item.get("categories"), dict) else {}
+        categories = item.get("categories")
+        cats = categories if isinstance(categories, dict) else {}
         location = str(cats.get("location") or item.get("workplaceType") or "").strip()
 
         if search_cfg and not config.is_title_allowed(title, search_cfg):
@@ -188,16 +193,16 @@ def parse_lever_jobs(
 
 
 def parse_ashby_jobs(
-    payload: dict,
+    payload: Any,
     employer_name: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Ashby `/posting-api/job-board/{token}?includeCompensation=true` JSON response."""
     raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -244,17 +249,17 @@ def parse_ashby_jobs(
 
 
 def parse_smartrecruiters_jobs(
-    payload: dict,
+    payload: Any,
     employer_name: str,
     company_token: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse SmartRecruiters `/v1/companies/{token}/postings` JSON response."""
     raw_jobs = payload.get("content", []) if isinstance(payload, dict) else []
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -264,7 +269,8 @@ def parse_smartrecruiters_jobs(
         if not title or not posting_id:
             continue
 
-        loc_obj = item.get("location") if isinstance(item.get("location"), dict) else {}
+        location_data = item.get("location")
+        loc_obj = location_data if isinstance(location_data, dict) else {}
         loc_parts = [
             str(loc_obj.get("city") or "").strip(),
             str(loc_obj.get("country") or "").strip(),
@@ -297,16 +303,16 @@ def parse_smartrecruiters_jobs(
 
 
 def parse_personio_jobs(
-    payload: list | dict | str,
+    payload: Any,
     employer_name: str,
     company_token: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Personio `/search.json` JSON or `/xml` feed response."""
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     if isinstance(payload, str) and "<position" in payload:
         import xml.etree.ElementTree as ET
@@ -376,17 +382,17 @@ def parse_personio_jobs(
 
 
 def parse_workable_jobs(
-    payload: dict | list,
+    payload: Any,
     employer_name: str,
     company_token: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Workable public widget API (`/api/v1/widget/accounts/{token}?details=true`) response."""
     raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -431,17 +437,17 @@ def parse_workable_jobs(
 
 
 def parse_recruitee_jobs(
-    payload: dict | list,
+    payload: Any,
     employer_name: str,
     company_token: str,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
     keywords: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Parse Recruitee public `/api/offers` JSON response."""
     raw_jobs = payload.get("offers", []) if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
-    parsed: list[dict] = []
+    parsed: list[dict[str, Any]] = []
 
     for item in raw_jobs:
         if not isinstance(item, dict):
@@ -484,160 +490,268 @@ def parse_recruitee_jobs(
 
 
 # ---------------------------------------------------------------------------
-# Fetcher & Runner
+# Async pooled fetcher & runner
 # ---------------------------------------------------------------------------
 
-def _scrape_single_ats_board(
+DEFAULT_PLATFORMS = (
+    "greenhouse",
+    "lever",
+    "ashby",
+    "smartrecruiters",
+    "personio",
+    "workable",
+    "recruitee",
+)
+ATSJob = dict[str, Any]
+BoardTask = tuple[str, dict[str, Any]]
+BoardResult = tuple[str, str, list[ATSJob]]
+HttpGetter = Callable[[str], httpx.Response]
+
+
+def _board_api_url(platform_name: str, employer: dict[str, Any]) -> str | None:
+    token = str(employer.get("token") or "").strip()
+    if not token:
+        return None
+    if platform_name == "greenhouse":
+        return f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+    if platform_name == "lever":
+        return f"https://api.lever.co/v0/postings/{token}?mode=json"
+    if platform_name == "ashby":
+        return f"https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true"
+    if platform_name == "smartrecruiters":
+        return f"https://api.smartrecruiters.com/v1/companies/{token}/postings?limit=100"
+    if platform_name == "personio":
+        host = f"{token}.jobs.personio.de" if "." not in token else token
+        return f"https://{host}/search.json"
+    if platform_name == "workable":
+        return f"https://apply.workable.com/api/v1/widget/accounts/{token}?details=true"
+    if platform_name == "recruitee":
+        return f"https://{token}.recruitee.com/api/offers"
+    return None
+
+
+def _parse_ats_board_response(
     platform_name: str,
-    employer: dict,
+    employer: dict[str, Any],
+    response: httpx.Response,
     accept_locs: list[str],
     reject_locs: list[str],
-    search_cfg: dict,
+    search_cfg: dict[str, Any],
     keywords: list[str],
-    http_get: Callable[[str], httpx.Response] | None = None,
-) -> tuple[str, str, list[dict]]:
-    """Fetch and parse a single employer board for Greenhouse, Lever, Ashby, SmartRecruiters, or Personio."""
-    name = employer.get("name") or employer.get("token") or "Unknown"
-    token = employer.get("token", "")
-    if not token:
-        return (platform_name, name, [])
+) -> BoardResult:
+    name = str(employer.get("name") or employer.get("token") or "Unknown")
+    token = str(employer.get("token") or "")
+    if response.status_code != 200:
+        log.debug("%s/%s returned HTTP %d", platform_name, name, response.status_code)
+        return platform_name, name, []
+    if platform_name == "personio" and response.text.lstrip().startswith("<"):
+        return (
+            platform_name,
+            name,
+            parse_personio_jobs(response.text, name, token, accept_locs, reject_locs, search_cfg, keywords),
+        )
 
+    payload = response.json()
+    parser_args = (payload, name, accept_locs, reject_locs, search_cfg, keywords)
     if platform_name == "greenhouse":
-        api_url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
+        jobs = parse_greenhouse_jobs(*parser_args)
     elif platform_name == "lever":
-        api_url = f"https://api.lever.co/v0/postings/{token}?mode=json"
+        jobs = parse_lever_jobs(*parser_args)
     elif platform_name == "ashby":
-        api_url = f"https://api.ashbyhq.com/posting-api/job-board/{token}?includeCompensation=true"
+        jobs = parse_ashby_jobs(*parser_args)
     elif platform_name == "smartrecruiters":
-        api_url = f"https://api.smartrecruiters.com/v1/companies/{token}/postings?limit=100"
+        jobs = parse_smartrecruiters_jobs(payload, name, token, accept_locs, reject_locs, search_cfg, keywords)
     elif platform_name == "personio":
-        host = f"{token}.jobs.personio.de" if "." not in token else token
-        api_url = f"https://{host}/search.json"
+        jobs = parse_personio_jobs(payload, name, token, accept_locs, reject_locs, search_cfg, keywords)
     elif platform_name == "workable":
-        api_url = f"https://apply.workable.com/api/v1/widget/accounts/{token}?details=true"
+        jobs = parse_workable_jobs(payload, name, token, accept_locs, reject_locs, search_cfg, keywords)
     elif platform_name == "recruitee":
-        api_url = f"https://{token}.recruitee.com/api/offers"
+        jobs = parse_recruitee_jobs(payload, name, token, accept_locs, reject_locs, search_cfg, keywords)
     else:
-        return (platform_name, name, [])
+        jobs = []
+    return platform_name, name, jobs
 
+
+async def _scrape_single_ats_board_async(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    platform_name: str,
+    employer: dict[str, Any],
+    accept_locs: list[str],
+    reject_locs: list[str],
+    search_cfg: dict[str, Any],
+    keywords: list[str],
+    http_get: HttpGetter | None = None,
+) -> BoardResult:
+    """Fetch one ATS board with shared pooling; test getters run off-loop."""
+    name = str(employer.get("name") or employer.get("token") or "Unknown")
+    api_url = _board_api_url(platform_name, employer)
+    if api_url is None:
+        return platform_name, name, []
     try:
-        if http_get is not None:
-            resp = http_get(api_url)
-        else:
-            with httpx.Client(timeout=_TIMEOUT, headers={"User-Agent": _UA}, follow_redirects=True) as client:
-                resp = client.get(api_url)
-
-        if resp.status_code != 200:
-            log.debug("%s/%s returned HTTP %d", platform_name, name, resp.status_code)
-            return (platform_name, name, [])
-
-        if platform_name == "personio" and resp.text.lstrip().startswith("<"):
-            jobs = parse_personio_jobs(resp.text, name, token, accept_locs, reject_locs, search_cfg, keywords)
-            return (platform_name, name, jobs)
-
-        data = resp.json()
-        if platform_name == "greenhouse":
-            jobs = parse_greenhouse_jobs(data, name, accept_locs, reject_locs, search_cfg, keywords)
-        elif platform_name == "lever":
-            jobs = parse_lever_jobs(data, name, accept_locs, reject_locs, search_cfg, keywords)
-        elif platform_name == "ashby":
-            jobs = parse_ashby_jobs(data, name, accept_locs, reject_locs, search_cfg, keywords)
-        elif platform_name == "personio":
-            jobs = parse_personio_jobs(data, name, token, accept_locs, reject_locs, search_cfg, keywords)
-        elif platform_name == "workable":
-            jobs = parse_workable_jobs(data, name, token, accept_locs, reject_locs, search_cfg, keywords)
-        elif platform_name == "recruitee":
-            jobs = parse_recruitee_jobs(data, name, token, accept_locs, reject_locs, search_cfg, keywords)
-        else:
-            jobs = parse_smartrecruiters_jobs(data, name, token, accept_locs, reject_locs, search_cfg, keywords)
-
-        return (platform_name, name, jobs)
-    except Exception as exc:
+        async with semaphore:
+            if http_get is not None:
+                response = await asyncio.to_thread(http_get, api_url)
+            else:
+                response = await request_with_retry(
+                    client,
+                    "GET",
+                    api_url,
+                    policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
+                    logger=log,
+                )
+        return _parse_ats_board_response(
+            platform_name, employer, response, accept_locs, reject_locs, search_cfg, keywords
+        )
+    except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
         log.debug("Direct ATS fetch failed for %s (%s): %s", name, platform_name, exc)
-        return (platform_name, name, [])
+        return platform_name, name, []
+    except Exception:
+        log.exception("Unexpected ATS parser failure for %s (%s)", name, platform_name)
+        return platform_name, name, []
 
 
-def run_ats_direct_discovery(
-    workers: int = 4,
-    platforms: list[str] | None = None,
-    http_get: Callable[[str], httpx.Response] | None = None,
-) -> dict:
-    """Run zero-browser direct ATS discovery across Greenhouse, Lever, Ashby, and SmartRecruiters.
-
-    Args:
-        workers: Parallel worker threads.
-        platforms: Optional subset of ['greenhouse', 'lever', 'ashby', 'smartrecruiters'].
-        http_get: Optional custom HTTP getter (used for unit testing without network).
-
-    Returns:
-        Summary dict with boards_checked, new_jobs, duplicate_jobs, by_platform.
-    """
-    conn = init_db()
+def _load_ats_discovery_config() -> tuple[dict[str, Any], list[str], list[str], list[str], dict[str, Any]]:
     search_cfg = config.load_search_config() if config.SEARCH_CONFIG_PATH.exists() else {}
     accept_locs, reject_locs = config.load_location_filters(search_cfg)
     keywords = _extract_query_keywords(search_cfg) if search_cfg else []
-    ats_registry = config.load_ats_employers()
+    return search_cfg, accept_locs, reject_locs, keywords, config.load_ats_employers()
 
-    active_platforms = platforms or [
-        "greenhouse",
-        "lever",
-        "ashby",
-        "smartrecruiters",
-        "personio",
-        "workable",
-        "recruitee",
+
+def _persist_ats_results(results: list[BoardResult], platforms: list[str]) -> dict[str, Any]:
+    conn = init_db()
+    total_new = 0
+    total_duplicates = 0
+    by_platform = {platform: 0 for platform in platforms}
+    try:
+        for platform, employer_name, jobs in results:
+            if not jobs:
+                continue
+            try:
+                new_count, duplicate_count = store_jobs(
+                    conn, jobs, site=employer_name, strategy=f"{platform}_api"
+                )
+            except Exception:
+                log.exception("Failed to store ATS results for %s (%s)", employer_name, platform)
+                continue
+            total_new += new_count
+            total_duplicates += duplicate_count
+            by_platform[platform] = by_platform.get(platform, 0) + new_count
+    finally:
+        close_connection()
+    return {
+        "boards_checked": len(results),
+        "new_jobs": total_new,
+        "duplicate_jobs": total_duplicates,
+        "by_platform": by_platform,
+    }
+
+
+async def run_ats_direct_discovery_async(
+    workers: int = 4,
+    platforms: list[str] | None = None,
+    http_get: HttpGetter | None = None,
+) -> dict[str, Any]:
+    """Discover jobs from public ATS APIs using one pooled AsyncClient.
+
+    Configuration reads and SQLite writes are delegated to worker threads, so
+    the event loop remains available while a batch fetches employer boards.
+    `http_get` remains available for backwards-compatible synchronous tests.
+    """
+    active_platforms = list(platforms or DEFAULT_PLATFORMS)
+    search_cfg, accept_locs, reject_locs, keywords, registry = await asyncio.to_thread(
+        _load_ats_discovery_config
+    )
+    tasks: list[BoardTask] = [
+        (platform, employer)
+        for platform in active_platforms
+        for employer in (registry.get(platform, []) or [])
+        if isinstance(employer, dict) and employer.get("token")
     ]
-    tasks: list[tuple[str, dict]] = []
-    for plat in active_platforms:
-        for emp in ats_registry.get(plat, []) or []:
-            if isinstance(emp, dict) and emp.get("token"):
-                tasks.append((plat, emp))
-
     if not tasks:
         return {"boards_checked": 0, "new_jobs": 0, "duplicate_jobs": 0, "by_platform": {}}
 
-    total_new = 0
-    total_dup = 0
-    by_platform: dict[str, int] = {p: 0 for p in active_platforms}
+    concurrency = max(1, min(workers, len(tasks), _MAX_BOARD_CONCURRENCY))
+    semaphore = asyncio.Semaphore(concurrency)
+    summary: dict[str, Any] = {
+        "boards_checked": 0,
+        "new_jobs": 0,
+        "duplicate_jobs": 0,
+        "by_platform": {platform: 0 for platform in active_platforms},
+    }
+    pending_results: list[BoardResult] = []
+    persist_lock = asyncio.Lock()
 
-    try:
-        max_w = max(1, min(workers, len(tasks)))
-        with ThreadPoolExecutor(max_workers=max_w) as pool:
-            futures = [
-                pool.submit(
-                    _scrape_single_ats_board,
-                    plat,
-                    emp,
+    async def _flush_pending_results() -> None:
+        if not pending_results:
+            return
+        batch = pending_results.copy()
+        pending_results.clear()
+        partial = await asyncio.to_thread(_persist_ats_results, batch, active_platforms)
+        summary["boards_checked"] += partial["boards_checked"]
+        summary["new_jobs"] += partial["new_jobs"]
+        summary["duplicate_jobs"] += partial["duplicate_jobs"]
+        for platform, count in partial["by_platform"].items():
+            summary["by_platform"][platform] = summary["by_platform"].get(platform, 0) + count
+
+    async def _persist_completed_result(result: BoardResult) -> None:
+        async with persist_lock:
+            pending_results.append(result)
+            if len(pending_results) >= _ATS_PERSIST_BATCH_SIZE:
+                await _flush_pending_results()
+
+    async with build_async_client(
+        timeout=httpx.Timeout(_TIMEOUT, connect=5.0),
+        max_connections=concurrency,
+        max_keepalive_connections=concurrency,
+        headers={"User-Agent": _UA},
+    ) as client:
+        next_index = 0
+
+        async def board_worker() -> None:
+            nonlocal next_index
+            while next_index < len(tasks):
+                index = next_index
+                next_index += 1
+                platform, employer = tasks[index]
+                result = await _scrape_single_ats_board_async(
+                    client,
+                    semaphore,
+                    platform,
+                    employer,
                     accept_locs,
                     reject_locs,
                     search_cfg,
                     keywords,
                     http_get,
                 )
-                for plat, emp in tasks
-            ]
-            for fut in as_completed(futures):
-                try:
-                    plat, emp_name, jobs = fut.result()
-                    if jobs:
-                        new_c, dup_c = store_jobs(conn, jobs, site=emp_name, strategy=f"{plat}_api")
-                        total_new += new_c
-                        total_dup += dup_c
-                        by_platform[plat] = by_platform.get(plat, 0) + new_c
-                except Exception as exc:
-                    log.warning("ATS board worker error: %s", exc)
-    finally:
-        close_connection()
+                await _persist_completed_result(result)
 
+        await asyncio.gather(*(board_worker() for _ in range(concurrency)))
+        async with persist_lock:
+            await _flush_pending_results()
     log.info(
         "Direct ATS discovery complete: %d boards checked, %d new jobs (%d duplicates)",
-        len(tasks),
-        total_new,
-        total_dup,
+        summary["boards_checked"],
+        summary["new_jobs"],
+        summary["duplicate_jobs"],
     )
-    return {
-        "boards_checked": len(tasks),
-        "new_jobs": total_new,
-        "duplicate_jobs": total_dup,
-        "by_platform": by_platform,
-    }
+    return summary
+
+
+def run_ats_direct_discovery(
+    workers: int = 4,
+    platforms: list[str] | None = None,
+    http_get: HttpGetter | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible synchronous CLI wrapper for async ATS discovery."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            run_ats_direct_discovery_async(workers=workers, platforms=platforms, http_get=http_get)
+        )
+    raise RuntimeError(
+        "run_ats_direct_discovery() cannot run inside an event loop; "
+        "await run_ats_direct_discovery_async() instead"
+    )

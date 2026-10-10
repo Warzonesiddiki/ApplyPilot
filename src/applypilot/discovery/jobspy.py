@@ -11,6 +11,7 @@ import sqlite3
 import time
 import warnings
 from datetime import UTC, datetime
+from typing import Any, Callable, TypedDict, cast
 
 from applypilot import config
 from applypilot.database import get_connection, init_db
@@ -18,11 +19,22 @@ from applypilot.database import get_connection, init_db
 log = logging.getLogger(__name__)
 
 
-def _get_scrape_jobs():
+class _SearchResult(TypedDict):
+    """Counters and label returned by a single JobSpy query."""
+
+    new: int
+    existing: int
+    errors: int
+    filtered: int
+    total: int
+    label: str
+
+
+def _get_scrape_jobs() -> Callable[..., Any]:
     """Lazy-import scrape_jobs from python-jobspy."""
     try:
         from jobspy import scrape_jobs
-        return scrape_jobs
+        return cast(Callable[..., Any], scrape_jobs)
     except ImportError as exc:
         raise RuntimeError(
             "python-jobspy is not installed. Install with:\n"
@@ -32,7 +44,7 @@ def _get_scrape_jobs():
 
 # -- Proxy parsing -----------------------------------------------------------
 
-def parse_proxy(proxy_str: str) -> dict:
+def parse_proxy(proxy_str: str) -> dict[str, Any]:
     """Parse host:port:user:pass into components."""
     parts = proxy_str.split(":")
     if len(parts) == 4:
@@ -67,7 +79,7 @@ def parse_proxy(proxy_str: str) -> dict:
 
 # -- Retry wrapper -----------------------------------------------------------
 
-def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0):
+def _scrape_with_retry(kwargs: dict[str, Any], max_retries: int = 2, backoff: float = 5.0) -> Any:
     """Call scrape_jobs with retry on transient failures."""
     scrape_jobs = _get_scrape_jobs()
     for attempt in range(max_retries + 1):
@@ -86,7 +98,7 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
 
 # -- Location filtering ------------------------------------------------------
 
-def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
+def _load_location_config(search_cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     """Extract accept/reject location lists from search config."""
     return config.load_location_filters(search_cfg)
 
@@ -100,9 +112,9 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
 def store_jobspy_results(
     conn: sqlite3.Connection,
-    df,
+    df: Any,
     source_label: str,
-    search_cfg: dict | None = None,
+    search_cfg: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
     from applypilot.database import compute_job_fingerprint, ensure_columns
@@ -203,18 +215,18 @@ def store_jobspy_results(
 # -- Single search execution -------------------------------------------------
 
 def _run_one_search(
-    search: dict,
+    search: dict[str, Any],
     sites: list[str],
     results_per_site: int,
     hours_old: int,
-    proxy_config: dict | None,
-    defaults: dict,
+    proxy_config: dict[str, Any] | None,
+    defaults: dict[str, Any],
     max_retries: int,
     accept_locs: list[str],
     reject_locs: list[str],
-    glassdoor_map: dict,
-    search_cfg: dict | None = None,
-) -> dict:
+    glassdoor_map: dict[str, Any],
+    search_cfg: dict[str, Any] | None = None,
+) -> _SearchResult:
     """Run a single search query and store results in DB."""
     s = search
     default_country = defaults.get("country_indeed") or (search_cfg or {}).get("country") or "uk"
@@ -320,7 +332,7 @@ def search_jobs(
     hours_old: int = 72,
     proxy: str | None = None,
     country_indeed: str | None = None,
-) -> dict:
+) -> dict[str, int | str]:
     """Run a single job search via JobSpy and store results in DB."""
     if sites is None:
         sites = ["indeed", "linkedin"]
@@ -382,7 +394,7 @@ def search_jobs(
 # -- Full crawl (all queries x all locations) --------------------------------
 
 def _full_crawl(
-    search_cfg: dict,
+    search_cfg: dict[str, Any],
     tiers: list[int] | None = None,
     locations: list[str] | None = None,
     sites: list[str] | None = None,
@@ -390,7 +402,7 @@ def _full_crawl(
     hours_old: int = 72,
     proxy: str | None = None,
     max_retries: int = 2,
-) -> dict:
+) -> dict[str, int | str]:
     """Run all search queries from search config across all locations."""
     if sites is None:
         sites = ["indeed", "linkedin"]
@@ -466,7 +478,7 @@ def _full_crawl(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_discovery(cfg: dict | None = None) -> dict:
+def run_discovery(cfg: dict[str, Any] | None = None) -> dict[str, int | str]:
     """Main entry point for JobSpy-based job discovery."""
     if cfg is None:
         cfg = config.load_search_config()

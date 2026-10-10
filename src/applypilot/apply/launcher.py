@@ -19,6 +19,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
 from rich.console import Console
 from rich.live import Live
@@ -47,18 +49,19 @@ from applypilot.database import get_connection
 logger = logging.getLogger(__name__)
 
 # Blocked sites loaded from config/sites.yaml
-def _load_blocked():
+def _load_blocked() -> tuple[set[str], list[str]]:
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
 
 # How often to poll the DB when the queue is empty (seconds)
-POLL_INTERVAL = config.DEFAULTS["poll_interval"]
+_default_poll_interval = config.DEFAULTS.get("poll_interval")
+POLL_INTERVAL: int = _default_poll_interval if isinstance(_default_poll_interval, int) else 60
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
 # Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
+_claude_procs: dict[int, subprocess.Popen[str]] = {}
 _claude_lock = threading.Lock()
 
 # Register cleanup on exit
@@ -71,7 +74,7 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
-def _make_mcp_config(cdp_port: int) -> dict:
+def _make_mcp_config(cdp_port: int) -> dict[str, Any]:
     """Build MCP config dict for a specific CDP port."""
     return {
         "mcpServers": {
@@ -96,7 +99,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0) -> dict[str, Any] | None:
     """Atomically acquire the next job to apply to.
 
     Args:
@@ -125,7 +128,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
+            params: list[Any] = [min_score]
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -309,7 +312,7 @@ def reset_failed() -> int:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
-def run_job(job: dict, port: int, worker_id: int = 0,
+def run_job(job: dict[str, Any], port: int, worker_id: int = 0,
             model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
@@ -383,11 +386,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
 
     start = time.time()
-    stats: dict = {}
+    stats: dict[str, Any] = {}
     proc = None
 
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen[str](
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -401,14 +404,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
 
-        proc.stdin.write(agent_prompt)
-        proc.stdin.close()
+        process_stdin = proc.stdin
+        process_stdout = proc.stdout
+        if process_stdin is None or process_stdout is None:
+            raise RuntimeError("Claude process pipes were not created")
+        process_stdin.write(agent_prompt)
+        process_stdin.close()
 
         text_parts: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
-            for line in proc.stdout:
+            for line in process_stdout:
                 line = line.strip()
                 if not line:
                     continue
@@ -710,7 +717,7 @@ def main(limit: int = 1, target_url: str | None = None,
     # Double Ctrl+C handler
     _ctrl_c_count = 0
 
-    def _sigint_handler(sig, frame):
+    def _sigint_handler(sig: int, frame: FrameType | None) -> None:
         nonlocal _ctrl_c_count
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
@@ -737,7 +744,7 @@ def main(limit: int = 1, target_url: str | None = None,
             # Daemon thread for display refresh only (no business logic)
             _dashboard_running = True
 
-            def _refresh():
+            def _refresh() -> None:
                 while _dashboard_running:
                     live.update(render_full())
                     time.sleep(0.5)

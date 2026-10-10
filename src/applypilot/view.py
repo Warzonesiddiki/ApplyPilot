@@ -79,7 +79,8 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
         FROM jobs GROUP BY site ORDER BY high_fit DESC, total DESC
     """).fetchall()
 
-    # Fetch all jobs (scored first, then unscored discovered jobs so dashboard is never empty)
+    # Stream jobs from SQLite; full descriptions and generated documents make
+    # retaining the entire result set redundant with the dashboard HTML.
     jobs = conn.execute("""
         SELECT url, title, company, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
@@ -89,7 +90,7 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
                prep_pack_path, outreach_path, crm_stage, user_notes
         FROM jobs
         ORDER BY COALESCE(fit_score, 0) DESC, site, title
-    """).fetchall()
+    """)
 
     base_resume_txt = _read_optional_file(str(config.RESUME_PATH)) if config.RESUME_PATH.exists() else ""
 

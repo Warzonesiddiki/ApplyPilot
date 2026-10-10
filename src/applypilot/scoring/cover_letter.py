@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 from datetime import UTC, datetime
 
 from applypilot import config
@@ -31,7 +32,7 @@ MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 # ── Prompt Builder (profile-driven & domain-adaptive) ─────────────────────
 
-def _build_cover_letter_prompt(profile: dict) -> str:
+def _build_cover_letter_prompt(profile: dict[str, Any]) -> str:
     """Build the cover letter system prompt from the user's profile."""
     domain = detect_profile_domain(profile)
     personal = profile.get("personal", {})
@@ -134,7 +135,7 @@ def _strip_preamble(text: str) -> str:
 # ── Core Generation ──────────────────────────────────────────────────────
 
 def generate_cover_letter(
-    resume_text: str, job: dict, profile: dict,
+    resume_text: str, job: dict[str, Any], profile: dict[str, Any],
     max_retries: int = 3, validation_mode: str = "normal",
 ) -> str:
     """Generate a cover letter with fresh context on each retry + auto-sanitize."""
@@ -190,7 +191,7 @@ def run_cover_letters(
     min_score: int = 7,
     limit: int = 20,
     validation_mode: str = "normal",
-) -> dict:
+) -> dict[str, int | float]:
     """Generate cover letters for high-scoring jobs that have tailored resumes."""
     profile = config.load_profile()
     resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
@@ -220,7 +221,7 @@ def run_cover_letters(
         len(jobs), min_score,
     )
     t0 = time.time()
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     error_count = 0
 
     for completed, job in enumerate(jobs, 1):

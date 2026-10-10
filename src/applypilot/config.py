@@ -7,6 +7,7 @@ import os
 import platform
 import shutil
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -151,13 +152,13 @@ def get_active_profile() -> str | None:
     return None
 
 
-def list_profiles() -> list[dict]:
+def list_profiles() -> list[dict[str, Any]]:
     """List all configured candidate profiles and their workspace status."""
     base = _get_base_dir()
     pdir = base / "profiles"
     active = get_active_profile()
 
-    items: list[dict] = [
+    items: list[dict[str, Any]] = [
         {
             "name": "default",
             "active": active is None,
@@ -271,7 +272,32 @@ def secure_write_text(path: Path, content: str) -> None:
             pass
 
 
-def load_profile() -> dict:
+def _string_keyed_mapping(value: Any) -> dict[str, Any]:
+    """Return a mapping containing only string-keyed entries."""
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(key, str):
+            result[key] = item
+    return result
+
+
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    """Load a YAML file as a validated string-keyed mapping."""
+    return _string_keyed_mapping(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize a YAML string or list of strings into a clean list."""
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def load_profile() -> dict[str, Any]:
     """Load user profile from the active profile's profile.json."""
     _refresh_paths()
     if not PROFILE_PATH.exists():
@@ -280,44 +306,63 @@ def load_profile() -> dict:
         raise FileNotFoundError(
             f"Profile not found at {PROFILE_PATH}. Run `{hint}` first."
         )
-    return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    profile: Any = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    if not isinstance(profile, dict):
+        raise ValueError(f"Profile at {PROFILE_PATH} must contain a JSON object")
+    return _string_keyed_mapping(profile)
 
 
-def load_search_config() -> dict:
+def load_search_config() -> dict[str, Any]:
     """Load search configuration from the active profile's searches.yaml."""
     _refresh_paths()
     if not SEARCH_CONFIG_PATH.exists():
         example = CONFIG_DIR / "searches.example.yaml"
         if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8")) or {}
+            return _read_yaml_mapping(example)
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    return _read_yaml_mapping(SEARCH_CONFIG_PATH)
 
 
-def load_sites_config() -> dict:
+def load_sites_config() -> dict[str, Any]:
     """Load sites.yaml configuration (sites list, manual_ats, blocked, etc.)."""
     path = CONFIG_DIR / "sites.yaml"
     if not path.exists():
         return {}
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return _read_yaml_mapping(path)
 
 
-def load_employers() -> list[dict] | dict:
+def load_employers() -> list[dict[str, Any]] | dict[str, Any]:
     """Load employers registry from bundled employers.yaml."""
     path = CONFIG_DIR / "employers.yaml"
     if not path.exists():
         return []
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return data.get("employers", [])
+    data = _read_yaml_mapping(path)
+    employers = data.get("employers", [])
+    if isinstance(employers, dict):
+        return {
+            key: _string_keyed_mapping(value)
+            for key, value in employers.items()
+            if isinstance(key, str) and isinstance(value, dict)
+        }
+    if isinstance(employers, list):
+        return [_string_keyed_mapping(value) for value in employers if isinstance(value, dict)]
+    return []
 
 
-def load_ats_employers() -> dict[str, list[dict]]:
+def load_ats_employers() -> dict[str, list[dict[str, Any]]]:
     """Load direct ATS employer registries (greenhouse, lever, ashby, smartrecruiters) from employers.yaml."""
     path = CONFIG_DIR / "employers.yaml"
     if not path.exists():
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    return data.get("ats_employers", {})
+    data = _read_yaml_mapping(path)
+    registries = data.get("ats_employers", {})
+    if not isinstance(registries, dict):
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for board, entries in registries.items():
+        if isinstance(board, str) and isinstance(entries, list):
+            result[board] = [_string_keyed_mapping(entry) for entry in entries if isinstance(entry, dict)]
+    return result
 
 
 def is_manual_ats(url: str | None) -> bool:
@@ -325,9 +370,9 @@ def is_manual_ats(url: str | None) -> bool:
     if not url:
         return False
     sites_cfg = load_sites_config()
-    domains = sites_cfg.get("manual_ats", [])
+    domains = _string_list(sites_cfg.get("manual_ats", []))
     url_lower = url.lower()
-    return any(domain in url_lower for domain in domains)
+    return any(domain.lower() in url_lower for domain in domains)
 
 
 def load_blocked_sites() -> tuple[set[str], list[str]]:
@@ -337,29 +382,36 @@ def load_blocked_sites() -> tuple[set[str], list[str]]:
         (blocked_site_names, blocked_url_patterns)
     """
     cfg = load_sites_config()
-    blocked = cfg.get("blocked", {})
-    sites = set(blocked.get("sites", []))
-    patterns = blocked.get("url_patterns", [])
+    blocked = _string_keyed_mapping(cfg.get("blocked", {}))
+    sites = set(_string_list(blocked.get("sites", [])))
+    patterns = _string_list(blocked.get("url_patterns", []))
     return sites, patterns
 
 
 def load_blocked_sso() -> list[str]:
     """Load blocked SSO domains from sites.yaml."""
     cfg = load_sites_config()
-    return cfg.get("blocked_sso", [])
+    return _string_list(cfg.get("blocked_sso", []))
 
 
 def load_base_urls() -> dict[str, str | None]:
     """Load site base URLs for URL resolution from sites.yaml."""
     cfg = load_sites_config()
-    return cfg.get("base_urls", {})
+    raw_base_urls = cfg.get("base_urls", {})
+    if not isinstance(raw_base_urls, dict):
+        return {}
+    return {
+        key: value
+        for key, value in raw_base_urls.items()
+        if isinstance(key, str) and (isinstance(value, str) or value is None)
+    }
 
 
 # ---------------------------------------------------------------------------
 # Unified Location, Title & EU/UK Country Resolution Helpers
 # ---------------------------------------------------------------------------
 
-def load_location_filters(search_cfg: dict | None = None) -> tuple[list[str], list[str]]:
+def load_location_filters(search_cfg: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
     """Extract (accept_patterns, reject_patterns) from search config.
 
     Supports top-level keys (`location_accept` / `location_reject_non_remote`),
@@ -370,36 +422,38 @@ def load_location_filters(search_cfg: dict | None = None) -> tuple[list[str], li
     if search_cfg is None:
         search_cfg = load_search_config()
 
-    loc_block = search_cfg.get("location")
-    filters_block = search_cfg.get("filters")
-    nested_accept = loc_block.get("accept_patterns", []) if isinstance(loc_block, dict) else []
-    nested_reject = loc_block.get("reject_patterns", []) if isinstance(loc_block, dict) else []
-    filter_accept = filters_block.get("location_accept", []) if isinstance(filters_block, dict) else []
-    filter_reject = (
-        filters_block.get("location_reject", []) or filters_block.get("location_reject_non_remote", [])
-        if isinstance(filters_block, dict)
-        else []
+    loc_block = _string_keyed_mapping(search_cfg.get("location"))
+    filters_block = _string_keyed_mapping(search_cfg.get("filters"))
+    nested_accept = _string_list(loc_block.get("accept_patterns", []))
+    nested_reject = _string_list(loc_block.get("reject_patterns", []))
+    filter_accept = _string_list(filters_block.get("location_accept", []))
+    filter_reject = _string_list(
+        filters_block.get("location_reject", [])
+        or filters_block.get("location_reject_non_remote", [])
     )
 
     accept = (
-        list(search_cfg.get("location_accept", []))
-        or list(nested_accept)
-        or list(filter_accept)
+        _string_list(search_cfg.get("location_accept", []))
+        or nested_accept
+        or filter_accept
     )
-    if not accept and isinstance(search_cfg.get("locations"), list):
+    locations = search_cfg.get("locations")
+    if not accept and isinstance(locations, list):
         derived: list[str] = []
-        for entry in search_cfg["locations"]:
-            loc_str = entry.get("location", "") if isinstance(entry, dict) else str(entry)
-            for part in loc_str.split(","):
+        for entry in locations:
+            loc_value = entry.get("location", "") if isinstance(entry, dict) else entry
+            if not isinstance(loc_value, str):
+                continue
+            for part in loc_value.split(","):
                 token = part.strip().lower()
                 if token and token not in derived:
                     derived.append(token)
         accept = derived
 
     reject = (
-        list(search_cfg.get("location_reject_non_remote", []))
-        or list(nested_reject)
-        or list(filter_reject)
+        _string_list(search_cfg.get("location_reject_non_remote", []))
+        or nested_reject
+        or filter_reject
     )
     return accept, reject
 
@@ -447,17 +501,17 @@ def is_location_allowed(
     return any(a and a.lower() in loc for a in accept_list)
 
 
-def is_title_allowed(title: str | None, search_cfg: dict | None = None) -> bool:
+def is_title_allowed(title: str | None, search_cfg: dict[str, Any] | None = None) -> bool:
     """Check if a job title passes the exclude_titles filter from searches.yaml."""
     if not title:
         return True
     if search_cfg is None:
         search_cfg = load_search_config()
-    exclude = search_cfg.get("exclude_titles", [])
+    exclude = _string_list(search_cfg.get("exclude_titles", []))
     if not exclude:
         return True
     title_lower = title.lower()
-    return not any(ex and ex.lower() in title_lower for ex in exclude)
+    return not any(ex.lower() in title_lower for ex in exclude)
 
 
 # Mapping of UK & European country/city substrings to JobSpy's `country_indeed` parameter

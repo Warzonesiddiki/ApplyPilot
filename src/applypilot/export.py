@@ -9,8 +9,10 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections.abc import Iterator
 from pathlib import Path
 import sqlite3
+from typing import Any
 
 from applypilot import config
 from applypilot.database import ensure_columns, get_connection
@@ -39,33 +41,46 @@ EXPORT_COLUMNS: tuple[str, ...] = (
 )
 
 
-def fetch_export_rows(
-    conn: sqlite3.Connection | None = None,
-    min_score: int = 0,
-    crm_stage: str | None = None,
-) -> list[dict]:
-    """Fetch job rows matching export filters."""
-    if conn is None:
-        conn = get_connection()
-    ensure_columns(conn)
-
+def _export_where_clause(min_score: int, crm_stage: str | None) -> tuple[str, list[int | str]]:
+    """Build the parameterized predicate shared by export reads and counts."""
     clauses = ["1=1"]
-    params: list = []
+    params: list[int | str] = []
     if min_score > 0:
         clauses.append("COALESCE(fit_score, 0) >= ?")
         params.append(min_score)
     if crm_stage:
         clauses.append("COALESCE(crm_stage, 'discovered') = ?")
         params.append(crm_stage.strip().lower())
+    return " AND ".join(clauses), params
 
-    where_sql = " AND ".join(clauses)
+
+def _iter_export_rows(
+    conn: sqlite3.Connection,
+    min_score: int = 0,
+    crm_stage: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Yield filtered export rows from a live SQLite cursor."""
+    ensure_columns(conn)
+    where_sql, params = _export_where_clause(min_score, crm_stage)
     col_sql = ", ".join(EXPORT_COLUMNS)
-    rows = conn.execute(
+    cursor = conn.execute(
         f"SELECT {col_sql} FROM jobs WHERE {where_sql} "
         "ORDER BY fit_score DESC NULLS LAST, discovered_at DESC",
         params,
-    ).fetchall()
-    return [dict(zip(EXPORT_COLUMNS, r)) for r in rows]
+    )
+    for row in cursor:
+        yield dict(zip(EXPORT_COLUMNS, row))
+
+
+def fetch_export_rows(
+    conn: sqlite3.Connection | None = None,
+    min_score: int = 0,
+    crm_stage: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch job rows matching export filters."""
+    if conn is None:
+        conn = get_connection()
+    return list(_iter_export_rows(conn, min_score=min_score, crm_stage=crm_stage))
 
 
 def export_jobs_csv_string(
@@ -74,11 +89,12 @@ def export_jobs_csv_string(
     crm_stage: str | None = None,
 ) -> str:
     """Render filtered jobs as a UTF-8 CSV string."""
-    rows = fetch_export_rows(conn=conn, min_score=min_score, crm_stage=crm_stage)
+    if conn is None:
+        conn = get_connection()
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(EXPORT_COLUMNS))
     writer.writeheader()
-    for r in rows:
+    for r in _iter_export_rows(conn, min_score=min_score, crm_stage=crm_stage):
         writer.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in EXPORT_COLUMNS})
     return buf.getvalue()
 
@@ -114,35 +130,56 @@ def export_jobs(
         out = config.APP_DIR / f"applypilot_export_{prof}.{clean_fmt}"
 
     out.parent.mkdir(parents=True, exist_ok=True)
-    rows = fetch_export_rows(min_score=min_score, crm_stage=crm_stage)
+    conn = get_connection()
 
     if clean_fmt == "csv":
-        out.write_text(
-            export_jobs_csv_string(min_score=min_score, crm_stage=crm_stage),
-            encoding="utf-8",
-        )
+        with out.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(EXPORT_COLUMNS))
+            writer.writeheader()
+            for row in _iter_export_rows(conn, min_score=min_score, crm_stage=crm_stage):
+                writer.writerow({key: ("" if row.get(key) is None else row.get(key)) for key in EXPORT_COLUMNS})
     elif clean_fmt == "json":
-        out.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        with out.open("w", encoding="utf-8") as handle:
+            handle.write("[")
+            has_rows = False
+            for row in _iter_export_rows(conn, min_score=min_score, crm_stage=crm_stage):
+                handle.write(",\n" if has_rows else "\n")
+                serialized = json.dumps(row, indent=2)
+                handle.write("  " + serialized.replace("\n", "\n  "))
+                has_rows = True
+            if has_rows:
+                handle.write("\n")
+            handle.write("]\n")
     else:
         prof_name = config.get_active_profile() or "default"
-        lines = [
+        ensure_columns(conn)
+        where_sql, params = _export_where_clause(min_score, crm_stage)
+        count_row = conn.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE {where_sql}",
+            params,
+        ).fetchone()
+        exported_count = int(count_row[0]) if count_row is not None else 0
+        header_lines = [
             f"# ApplyPilot Pipeline Export ({prof_name})",
             "",
-            f"Total Exported Jobs: **{len(rows)}**",
+            f"Total Exported Jobs: **{exported_count}**",
             "",
             "| Score | ATS % | Company | Title | Location | Sponsor | Stage | URL |",
             "| :---: | :---: | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
-        for r in rows:
-            score_s = str(r.get("fit_score") if r.get("fit_score") is not None else "-")
-            ats_s = f"{r['ats_coverage_pct']}%" if r.get("ats_coverage_pct") is not None else "-"
-            comp = str(r.get("company") or r.get("site") or "-").replace("|", "/")
-            title = str(r.get("title") or "-").replace("|", "/")
-            loc = str(r.get("location") or "-").replace("|", "/")
-            sp = str(r.get("sponsor_status") or "-")
-            st = str(r.get("crm_stage") or "discovered")
-            url = str(r.get("url") or "")
-            lines.append(f"| {score_s} | {ats_s} | {comp} | {title} | {loc} | {sp} | {st} | {url} |")
-        out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with out.open("w", encoding="utf-8") as handle:
+            handle.write("\n".join(header_lines) + "\n")
+            for row in _iter_export_rows(conn, min_score=min_score, crm_stage=crm_stage):
+                score_s = str(row.get("fit_score") if row.get("fit_score") is not None else "-")
+                ats_s = f"{row['ats_coverage_pct']}%" if row.get("ats_coverage_pct") is not None else "-"
+                comp = str(row.get("company") or row.get("site") or "-").replace("|", "/")
+                title = str(row.get("title") or "-").replace("|", "/")
+                loc = str(row.get("location") or "-").replace("|", "/")
+                sponsor = str(row.get("sponsor_status") or "-")
+                stage = str(row.get("crm_stage") or "discovered")
+                url = str(row.get("url") or "")
+                handle.write(
+                    f"| {score_s} | {ats_s} | {comp} | {title} | {loc} | {sponsor} | {stage} | {url} |\n"
+                )
 
     return out

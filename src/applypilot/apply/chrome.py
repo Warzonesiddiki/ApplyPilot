@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from applypilot import config
 
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 BASE_CDP_PORT = 9222
 
 # Track Chrome processes per worker for cleanup
-_chrome_procs: dict[int, subprocess.Popen] = {}
+_chrome_procs: dict[int, subprocess.Popen[bytes]] = {}
 _chrome_lock = threading.Lock()
 
 
@@ -187,7 +188,7 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+                  headless: bool = False) -> subprocess.Popen[bytes]:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
@@ -236,12 +237,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
         cmd.append("--headless=new")
 
     # On Unix, start in a new process group so we can kill the whole tree
-    kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    kwargs: dict[str, Any] = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if platform.system() != "Windows":
         import os
         kwargs["preexec_fn"] = os.setsid
 
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = subprocess.Popen[bytes](cmd, **kwargs)
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
@@ -252,7 +253,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     return proc
 
 
-def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
+def cleanup_worker(worker_id: int, process: subprocess.Popen[bytes] | None) -> None:
     """Kill a worker's Chrome instance and remove it from tracking.
 
     Args:

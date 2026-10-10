@@ -246,33 +246,42 @@ def reset_transient_failed_jobs(
     if conn is None:
         conn = get_connection()
 
-    rows = conn.execute(
-        "SELECT url, apply_error FROM jobs WHERE applied_at IS NULL AND apply_error IS NOT NULL"
-    ).fetchall()
-
     allowed_buckets = {"retryable"}
     if include_captcha:
         allowed_buckets.add("captcha_blocked")
 
-    reset_urls: list[str] = []
+    checked = 0
+    reset_count = 0
     by_bucket: dict[str, int] = {}
+    last_rowid = 0
 
-    for row in rows:
-        url, err = row[0], row[1]
-        bucket = classify_apply_error(err)
-        by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
-        if bucket in allowed_buckets:
-            reset_urls.append(url)
+    # Scan failed jobs in bounded rowid windows: the URL/error pairs are small,
+    # but a large failed backlog should not be materialized in one result set.
+    while True:
+        rows = conn.execute(
+            "SELECT rowid, url, apply_error FROM jobs "
+            "WHERE applied_at IS NULL AND apply_error IS NOT NULL AND rowid > ? "
+            "ORDER BY rowid LIMIT 500",
+            (last_rowid,),
+        ).fetchall()
+        if not rows:
+            break
 
-    for url in reset_urls:
-        conn.execute(
-            "UPDATE jobs SET apply_error = NULL, apply_status = NULL, apply_attempts = 0 WHERE url = ?",
-            (url,),
-        )
-    conn.commit()
+        for row in rows:
+            last_rowid = int(row[0])
+            checked += 1
+            bucket = classify_apply_error(str(row[2]))
+            by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
+            if bucket in allowed_buckets:
+                conn.execute(
+                    "UPDATE jobs SET apply_error = NULL, apply_status = NULL, apply_attempts = 0 WHERE url = ?",
+                    (row[1],),
+                )
+                reset_count += 1
+        conn.commit()
 
     return {
-        "checked": len(rows),
-        "reset_count": len(reset_urls),
+        "checked": checked,
+        "reset_count": reset_count,
         "by_bucket": by_bucket,
     }

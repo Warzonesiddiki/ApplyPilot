@@ -7,6 +7,7 @@ without migration ordering issues.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -18,10 +19,16 @@ from typing import Any, BinaryIO, Protocol, cast
 
 from applypilot import config
 
+log = logging.getLogger(__name__)
+
 # Thread-local connection storage — each thread gets its own connection.
 _local = threading.local()
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
 _SQLITE_LOCK_TIMEOUT_SECONDS = 30.0
+# Safety cap applied when get_jobs_by_stage is asked for an "unlimited" batch
+# (limit <= 0). Rows carry full descriptions, so an unbounded SELECT * could
+# materialize the whole table; 1000 rows is 10x the largest stage default.
+_MAX_UNLIMITED_STAGE_ROWS = 1000
 JobRecord = dict[str, Any]
 DatabaseStats = dict[str, Any]
 
@@ -876,7 +883,9 @@ def get_jobs_by_stage(
         conn: Database connection. Uses get_connection() if None.
         stage: One of "discovered", "enriched", "scored", "tailored", "applied", etc.
         min_score: Minimum fit_score filter (only relevant for scored+ stages).
-        limit: Maximum number of rows to return.
+        limit: Maximum number of rows to return. Values <= 0 mean "no explicit
+            limit" and are clamped to ``_MAX_UNLIMITED_STAGE_ROWS`` so a single
+            call can never materialize an unbounded ``SELECT *`` result set.
 
     Returns:
         List of job dicts.
@@ -914,12 +923,21 @@ def get_jobs_by_stage(
         where += " AND fit_score >= ?"
         params.append(min_score)
 
+    effective_limit = limit if limit > 0 else _MAX_UNLIMITED_STAGE_ROWS
+
     query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
-    if limit > 0:
-        query += " LIMIT ?"
-        params.append(limit)
+    query += " LIMIT ?"
+    params.append(effective_limit)
 
     rows = conn.execute(query, params).fetchall()
+    if limit <= 0 and len(rows) >= effective_limit:
+        log.warning(
+            "get_jobs_by_stage(stage=%r) returned the %d-row safety cap for an unlimited "
+            "query; additional matching rows were not fetched. Pass an explicit limit "
+            "to raise this bound.",
+            stage,
+            effective_limit,
+        )
 
     if rows:
         columns = rows[0].keys()

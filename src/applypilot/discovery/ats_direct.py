@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import re
 from collections.abc import Callable
@@ -20,7 +21,7 @@ import httpx
 from applypilot import config
 from applypilot.database import close_connection, init_db, store_jobs
 from applypilot.discovery.workday import strip_html
-from applypilot.network import RetryPolicy, build_async_client, request_with_retry
+from applypilot.network import RetryPolicy, build_async_client, request_bounded_bytes
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,10 @@ _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ch
 _TIMEOUT = 20.0
 _MAX_BOARD_CONCURRENCY = 64
 _ATS_PERSIST_BATCH_SIZE = 8
+# Hard cap on a single ATS board response body, enforced on decoded bytes as
+# they stream in. Boards routinely carry thousands of postings with full
+# descriptions; 8 MiB is generous headroom while still bounding memory.
+_MAX_BOARD_RESPONSE_BYTES = 8_000_000
 
 
 def _extract_query_keywords(search_cfg: dict[str, Any] | None = None) -> list[str]:
@@ -530,28 +535,30 @@ def _board_api_url(platform_name: str, employer: dict[str, Any]) -> str | None:
     return None
 
 
-def _parse_ats_board_response(
+def _parse_ats_board_payload(
     platform_name: str,
     employer: dict[str, Any],
-    response: httpx.Response,
+    status_code: int,
+    body_text: str,
     accept_locs: list[str],
     reject_locs: list[str],
     search_cfg: dict[str, Any],
     keywords: list[str],
 ) -> BoardResult:
+    """Parse a fetched board payload from its status code and decoded body."""
     name = str(employer.get("name") or employer.get("token") or "Unknown")
     token = str(employer.get("token") or "")
-    if response.status_code != 200:
-        log.debug("%s/%s returned HTTP %d", platform_name, name, response.status_code)
+    if status_code != 200:
+        log.debug("%s/%s returned HTTP %d", platform_name, name, status_code)
         return platform_name, name, []
-    if platform_name == "personio" and response.text.lstrip().startswith("<"):
+    if platform_name == "personio" and body_text.lstrip().startswith("<"):
         return (
             platform_name,
             name,
-            parse_personio_jobs(response.text, name, token, accept_locs, reject_locs, search_cfg, keywords),
+            parse_personio_jobs(body_text, name, token, accept_locs, reject_locs, search_cfg, keywords),
         )
 
-    payload = response.json()
+    payload: Any = json.loads(body_text)
     parser_args = (payload, name, accept_locs, reject_locs, search_cfg, keywords)
     if platform_name == "greenhouse":
         jobs = parse_greenhouse_jobs(*parser_args)
@@ -592,16 +599,21 @@ async def _scrape_single_ats_board_async(
         async with semaphore:
             if http_get is not None:
                 response = await asyncio.to_thread(http_get, api_url)
+                status_code = response.status_code
+                body_text = response.text
             else:
-                response = await request_with_retry(
+                body = await request_bounded_bytes(
                     client,
                     "GET",
                     api_url,
+                    max_bytes=_MAX_BOARD_RESPONSE_BYTES,
                     policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
                     logger=log,
                 )
-        return _parse_ats_board_response(
-            platform_name, employer, response, accept_locs, reject_locs, search_cfg, keywords
+                status_code = 200
+                body_text = body.decode("utf-8", errors="replace")
+        return _parse_ats_board_payload(
+            platform_name, employer, status_code, body_text, accept_locs, reject_locs, search_cfg, keywords
         )
     except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
         log.debug("Direct ATS fetch failed for %s (%s): %s", name, platform_name, exc)

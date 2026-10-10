@@ -92,3 +92,38 @@ def test_pipeline_pdf_pending_sql_terminates(tmp_path: Path, monkeypatch: pytest
     pending_after = pipeline._count_pending("pdf", min_score=7)
     assert pending_after == 0
     database.close_connection()
+
+
+def test_get_jobs_by_stage_caps_unlimited_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """limit <= 0 must clamp to the safety cap instead of materializing the whole table."""
+    monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
+    config.set_active_profile("stage-cap-tests")
+    conn = database.init_db()
+
+    beyond_cap = database._MAX_UNLIMITED_STAGE_ROWS + 250
+    database.store_jobs(
+        conn,
+        jobs=[
+            {
+                "url": f"https://jobs.example.eu/role-{index}",
+                "title": f"Financial Accountant {index}",
+                "company": "ING Group",
+            }
+            for index in range(beyond_cap)
+        ],
+        site="ING Group",
+        strategy="workday",
+    )
+
+    try:
+        unlimited = database.get_jobs_by_stage(conn=conn, stage="discovered", limit=0)
+        assert len(unlimited) == database._MAX_UNLIMITED_STAGE_ROWS
+
+        explicit = database.get_jobs_by_stage(conn=conn, stage="discovered", limit=50)
+        assert len(explicit) == 50
+    finally:
+        database.close_connection()
+        config.set_active_profile(None)

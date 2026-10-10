@@ -16,7 +16,7 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from threading import Event, Lock
 from typing import Any
@@ -40,6 +40,27 @@ _DETAIL_JSON_LD_MAX_DOCUMENTS = 16
 _DETAIL_JSON_LD_MAX_DOCUMENT_CHARS = 256_000
 _DETAIL_JSON_LD_MAX_TOTAL_CHARS = 1_000_000
 _WTTJ_RESPONSE_MAX_CHARS = 8_000_000
+
+
+def _algolia_capture_within_limit(headers: Mapping[str, str]) -> bool:
+    """Decide from response headers whether an Algolia payload may be read.
+
+    Playwright materializes a body fully once ``response.text()`` is called, so
+    the only pre-transfer bound available is a declared, parsable
+    ``Content-Length`` within the cap. Responses without one (chunked or
+    unknown-size) are skipped rather than read unbounded; the character check
+    after transfer remains as a second guard for lying headers.
+    """
+    normalized = {name.lower(): value for name, value in headers.items()}
+    content_length = normalized.get("content-length")
+    if content_length is None:
+        return False
+    try:
+        declared_bytes = int(content_length)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= declared_bytes <= _WTTJ_RESPONSE_MAX_CHARS
+
 
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
@@ -174,13 +195,8 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
     def capture_algolia(response: Response) -> None:
         if "algolia.net" not in response.url or "/queries" not in response.url:
             return
-        content_length = response.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > _WTTJ_RESPONSE_MAX_CHARS:
-                    return
-            except ValueError:
-                return
+        if not _algolia_capture_within_limit(response.headers):
+            return
         try:
             response_text = response.text()
             if len(response_text) <= _WTTJ_RESPONSE_MAX_CHARS:

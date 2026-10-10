@@ -25,7 +25,7 @@ import yaml
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import close_connection, get_connection, init_db
-from applypilot.network import RetryPolicy, build_async_client, request_with_retry
+from applypilot.network import RetryPolicy, build_async_client, request_bounded_json
 
 log = logging.getLogger(__name__)
 
@@ -141,11 +141,14 @@ def setup_proxy(proxy_str: str | None) -> None:
 _WORKDAY_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 _MAX_WORKDAY_CONCURRENCY = 32
 _DETAIL_WORKERS_PER_EMPLOYER = 4
+# Hard cap on a single Workday CXS response body, enforced on decoded bytes as
+# they stream in. A board page is ~20 postings, so 2 MiB is generous headroom
+# while preventing a hostile or misbehaving endpoint from exhausting memory.
+_MAX_WORKDAY_RESPONSE_BYTES = 2_000_000
 
 
-def _response_json_object(response: httpx.Response) -> dict[str, Any]:
-    """Decode a Workday response and reject non-object JSON payloads."""
-    payload: Any = response.json()
+def _json_object_payload(payload: Any) -> dict[str, Any]:
+    """Reject non-object JSON payloads from Workday endpoints."""
     if not isinstance(payload, dict):
         raise ValueError("Workday API response must be a JSON object")
     return payload
@@ -162,7 +165,7 @@ def workday_search(employer: dict[str, Any], search_text: str, limit: int = 20, 
             headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _WORKDAY_UA},
         )
         response.raise_for_status()
-        return _response_json_object(response)
+        return _json_object_payload(response.json())
 
 
 def workday_detail(employer: dict[str, Any], external_path: str) -> dict[str, Any]:
@@ -171,7 +174,7 @@ def workday_detail(employer: dict[str, Any], external_path: str) -> dict[str, An
     with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0), proxy=_proxy_url, follow_redirects=True) as client:
         response = client.get(url, headers={"Accept": "application/json", "User-Agent": _WORKDAY_UA})
         response.raise_for_status()
-        return _response_json_object(response)
+        return _json_object_payload(response.json())
 
 
 async def workday_search_async(
@@ -183,17 +186,17 @@ async def workday_search_async(
 ) -> dict[str, Any]:
     """Search Workday's CXS API without blocking the running event loop."""
     url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}/jobs"
-    response = await request_with_retry(
+    payload = await request_bounded_json(
         client,
         "POST",
         url,
         json={"appliedFacets": {}, "limit": limit, "offset": offset, "searchText": search_text},
         headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _WORKDAY_UA},
+        max_bytes=_MAX_WORKDAY_RESPONSE_BYTES,
         policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
         logger=log,
     )
-    response.raise_for_status()
-    return _response_json_object(response)
+    return _json_object_payload(payload)
 
 
 async def workday_detail_async(
@@ -203,16 +206,16 @@ async def workday_detail_async(
 ) -> dict[str, Any]:
     """Fetch a Workday job detail using the shared async connection pool."""
     url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}{external_path}"
-    response = await request_with_retry(
+    payload = await request_bounded_json(
         client,
         "GET",
         url,
         headers={"Accept": "application/json", "User-Agent": _WORKDAY_UA},
+        max_bytes=_MAX_WORKDAY_RESPONSE_BYTES,
         policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
         logger=log,
     )
-    response.raise_for_status()
-    return _response_json_object(response)
+    return _json_object_payload(payload)
 
 
 # -- Search + paginate -------------------------------------------------------
@@ -390,31 +393,6 @@ async def _iter_search_employer_pages(
         if offset >= (total or 0) or (max_results > 0 and emitted >= max_results):
             break
 
-
-async def _search_employer_async(
-    client: httpx.AsyncClient,
-    employer_key: str,
-    employer: dict[str, Any],
-    search_text: str,
-    location_filter: bool,
-    max_results: int,
-    accept_locs: list[str],
-    reject_locs: list[str],
-) -> list[dict[str, Any]]:
-    """Collect all Workday search pages for compatibility with existing callers."""
-    jobs: list[dict[str, Any]] = []
-    async for page_jobs in _iter_search_employer_pages(
-        client,
-        employer_key,
-        employer,
-        search_text,
-        location_filter,
-        max_results,
-        accept_locs,
-        reject_locs,
-    ):
-        jobs.extend(page_jobs)
-    return jobs
 
 async def _fetch_one_detail_async(
     client: httpx.AsyncClient,

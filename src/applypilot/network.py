@@ -1,9 +1,14 @@
-"""Shared async HTTP primitives with connection pooling and resilient retries."""
+"""Shared async HTTP primitives with connection pooling and resilient retries.
+
+Also provides streaming, decompressed-byte-bounded body readers so callers can
+cap response memory as bytes arrive instead of after materialization.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import email.utils
+import json
 import logging
 import math
 import random
@@ -27,6 +32,15 @@ _TRANSIENT_EXCEPTIONS = (
     httpx.WriteTimeout,
     httpx.PoolTimeout,
 )
+
+
+class ResponseBodyTooLarge(ValueError):
+    """A streamed response body exceeded the configured decompressed-byte cap.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` handlers
+    around discovery fetches keep treating oversized payloads as skip-able
+    failures rather than crashes.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,3 +191,104 @@ async def request_with_retry(
         await asyncio.sleep(wait)
 
     raise RuntimeError("HTTP retry loop exited unexpectedly")
+
+
+async def request_bounded_bytes(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    max_bytes: int,
+    policy: RetryPolicy | None = None,
+    logger: logging.Logger | None = None,
+    **kwargs: Any,
+) -> bytes:
+    """Issue a streaming request and return at most ``max_bytes`` of body.
+
+    Unlike :func:`request_with_retry`, the response is never materialized in
+    full: bytes are accumulated from ``aiter_bytes()`` (after content decoding)
+    and the connection is closed as soon as the cap is exceeded, so the
+    remainder of an oversized, decompressed body is not transferred. This makes
+    the cap independent of any declared ``Content-Length`` header, which does
+    not bound the decoded size of compressed responses.
+
+    Transport errors and transient status codes are retried with the same
+    policy as :func:`request_with_retry`. Non-2xx responses raise
+    :class:`httpx.HTTPStatusError`; bodies larger than ``max_bytes`` raise
+    :class:`ResponseBodyTooLarge`.
+    """
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+
+    selected_policy = policy or RetryPolicy()
+    request_logger = logger or log
+
+    for attempt in range(selected_policy.max_attempts):
+        retry_wait: float | None = None
+        try:
+            async with client.stream(method, url, **kwargs) as response:
+                if (
+                    response.status_code in selected_policy.retry_status_codes
+                    and attempt + 1 < selected_policy.max_attempts
+                ):
+                    retry_wait = selected_policy.delay(attempt, response.headers)
+                    request_logger.warning(
+                        "Transient HTTP %d (stream), retry %d/%d in %.2fs: %s",
+                        response.status_code,
+                        attempt + 1,
+                        selected_policy.max_attempts - 1,
+                        retry_wait,
+                        url,
+                    )
+                else:
+                    response.raise_for_status()
+                    received = 0
+                    chunks: list[bytes] = []
+                    async for chunk in response.aiter_bytes():
+                        received += len(chunk)
+                        if received > max_bytes:
+                            raise ResponseBodyTooLarge(
+                                f"Response body from {url} exceeded the {max_bytes}-byte cap "
+                                f"after receiving {received} decoded bytes"
+                            )
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        except _TRANSIENT_EXCEPTIONS as exc:
+            if attempt + 1 >= selected_policy.max_attempts:
+                raise
+            retry_wait = selected_policy.delay(attempt)
+            request_logger.warning(
+                "Transient HTTP transport error (%s, stream), retry %d/%d in %.2fs: %s",
+                type(exc).__name__,
+                attempt + 1,
+                selected_policy.max_attempts - 1,
+                retry_wait,
+                url,
+            )
+        if retry_wait is not None:
+            await asyncio.sleep(retry_wait)
+
+    raise RuntimeError("Bounded HTTP retry loop exited unexpectedly")
+
+
+async def request_bounded_json(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    max_bytes: int,
+    policy: RetryPolicy | None = None,
+    logger: logging.Logger | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Fetch a byte-bounded response body and decode it as JSON.
+
+    Returns the decoded JSON value (object, array, or scalar) without imposing
+    a shape; callers validate the payload. Raises :class:`ResponseBodyTooLarge`
+    when the decoded body exceeds ``max_bytes`` and :class:`json.JSONDecodeError`
+    when the body is not valid JSON.
+    """
+    body = await request_bounded_bytes(
+        client, method, url, max_bytes=max_bytes, policy=policy, logger=logger, **kwargs
+    )
+    return json.loads(body)

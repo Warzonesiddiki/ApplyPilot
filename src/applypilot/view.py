@@ -131,181 +131,6 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
           </div>
         </div>"""
 
-    job_sections = ""
-    current_score = None
-    for j in jobs:
-        score = j["fit_score"] if j["fit_score"] is not None else 0
-        if score != current_score:
-            if current_score is not None:
-                job_sections += "</div>"
-            score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#64748b")
-            score_label = {
-                10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
-                7: "Good Fit", 6: "Moderate+", 5: "Moderate", 0: "Unscored / Discovered",
-            }.get(score, f"Score {score}")
-            count_at_score = score_dist.get(score, 0) if score > 0 else (total - scored)
-            job_sections += f"""
-            <h2 class="score-header" style="border-color:{score_color}">
-              <span class="score-badge" style="background:{score_color}">{score if score > 0 else '–'}</span>
-              {score_label} ({count_at_score} jobs)
-            </h2>
-            <div class="job-grid">"""
-            current_score = score
-
-        title = escape(j["title"] or "Untitled")
-        company = escape(j["company"] or j["site"] or "Employer")
-        url = escape(j["url"] or "")
-        salary = escape(j["salary"] or "")
-        location = escape(j["location"] or "")
-        site = escape(j["site"] or "")
-        site_color = colors.get(j["site"] or "", "#60a5fa")
-        apply_url = escape(j["application_url"] or j["url"] or "")
-        sponsor_status = j["sponsor_status"] or "unknown"
-        work_arr = j["work_arrangement"] or "onsite"
-        crm_stage = j["crm_stage"] or "discovered"
-        ats_pct = j["ats_coverage_pct"]
-
-        reasoning_raw = j["score_reasoning"] or ""
-        reasoning_lines = reasoning_raw.split("\n")
-        keywords = reasoning_lines[0][:140] if reasoning_lines else ""
-        reasoning = reasoning_lines[1][:240] if len(reasoning_lines) > 1 else ""
-
-        sub_pills_html = ""
-        if j["score_breakdown"]:
-            try:
-                bd = json.loads(j["score_breakdown"])
-                sub_pills_html = (
-                    f'<div class="subscore-row">'
-                    f'<span class="sub-pill">Skills: {bd.get("skills_score", "-")}</span>'
-                    f'<span class="sub-pill">Quals: {bd.get("qualifications_score", "-")}</span>'
-                    f'<span class="sub-pill">Domain: {bd.get("domain_score", "-")}</span>'
-                    f'<span class="sub-pill">Loc/Visa: {bd.get("location_score", "-")}</span>'
-                    f"</div>"
-                )
-            except Exception:
-                pass
-
-        meta_parts = [
-            f'<span class="meta-tag company-tag">{company}</span>',
-            f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>',
-        ]
-        if salary:
-            meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
-        if location:
-            meta_parts.append(f'<span class="meta-tag location">{location[:42]}</span>')
-        if ats_pct is not None:
-            meta_parts.append(f'<span class="meta-tag ats-tag">ATS: {ats_pct}%</span>')
-        if sponsor_status == "sponsorship_offered":
-            meta_parts.append('<span class="meta-tag sponsor-yes">★ Visa Sponsorship Offered</span>')
-        elif sponsor_status == "licensed_sponsor":
-            meta_parts.append('<span class="meta-tag sponsor-lic">✓ Licensed UK/EU Sponsor</span>')
-        elif sponsor_status == "no_sponsorship_stated":
-            meta_parts.append('<span class="meta-tag sponsor-no">⚠ No Sponsorship Stated</span>')
-        meta_parts.append(f'<span class="meta-tag arr-tag">{escape(work_arr.title())}</span>')
-        meta_parts.append(f'<span class="meta-tag stage-tag">{escape(crm_stage.upper())}</span>')
-        meta_html = " ".join(meta_parts)
-
-        full_text = j["full_description"] or j["description"] or ""
-        desc_preview = escape(full_text)[:280]
-        full_desc_html = escape(full_text).replace("\n", "<br>")
-        desc_len = len(full_text)
-
-        tailored_txt = _read_optional_file(j["tailored_resume_path"])
-        cover_txt = _read_optional_file(j["cover_letter_path"])
-        prep_txt = _read_optional_file(j["prep_pack_path"])
-        outreach_txt = _read_optional_file(j["outreach_path"])
-
-        drawers_html = ""
-        if full_text:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Full Description ({desc_len:,} chars)</summary>"
-                f"<div class='full-desc'>{full_desc_html}</div></details>"
-            )
-        if tailored_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Tailored CV Preview</summary>"
-                f"<div class='full-desc'>{escape(tailored_txt)}</div></details>"
-            )
-            if base_resume_txt:
-                drawers_html += (
-                    f"<details class='full-desc-details'><summary class='expand-btn'>"
-                    f"Base vs. Tailored CV Side-by-Side Diff</summary>"
-                    f"<div class='diff-grid'>"
-                    f"<div class='full-desc'><strong>Base CV</strong>\n\n{escape(base_resume_txt)}</div>"
-                    f"<div class='full-desc'><strong>Tailored CV (ATS: {ats_pct if ats_pct is not None else '-'}%)</strong>\n\n{escape(tailored_txt)}</div>"
-                    f"</div></details>"
-                )
-        if cover_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Cover Letter Preview</summary>"
-                f"<div class='full-desc'>{escape(cover_txt)}</div></details>"
-            )
-        if prep_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Interview Prep Dossier</summary>"
-                f"<div class='full-desc'>{escape(prep_txt)}</div></details>"
-            )
-        if outreach_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"LinkedIn & Cold Email Outreach</summary>"
-                f"<div class='full-desc'>{escape(outreach_txt)}</div></details>"
-            )
-
-        user_notes_txt = escape(j["user_notes"] or "")
-        notes_html = f'<div class="notes-box">📝 {user_notes_txt}</div>' if user_notes_txt else ""
-        if interactive_api:
-            notes_html += (
-                f'<div class="notes-edit-row">'
-                f'<input type="text" class="search-input notes-input" placeholder="Add CRM note / follow-up..." value="{user_notes_txt}" '
-                f'onchange="saveJobNote(\'{url}\', this.value)">'
-                f'</div>'
-            )
-
-        crm_controls_html = ""
-        if interactive_api:
-            stages_list = [
-                "discovered", "enriched", "scored", "tailored",
-                "ready_to_apply", "applied", "assessment", "interviewing", "offer", "rejected", "archived",
-            ]
-            opts = "".join(
-                f'<option value="{st}" {"selected" if st == crm_stage else ""}>{st.upper()}</option>'
-                for st in stages_list
-            )
-            crm_controls_html = (
-                f'<select class="select-input stage-select" onchange="updateJobStage(\'{url}\', this.value)">{opts}</select>'
-                f'<button class="filter-btn" onclick="generatePrepAndOutreach(\'{url}\', this)">⚡ Prep & Outreach</button>'
-                f'<button class="filter-btn" onclick="generateProofPacket(\'{url}\', this)">🛡 Proof</button>'
-            )
-
-        apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>' if apply_url else ""
-
-        job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}"
-             data-location="{location.lower()}" data-sponsor="{escape(sponsor_status)}"
-             data-arrangement="{escape(work_arr)}" data-stage="{escape(crm_stage)}"
-             data-url="{url}">
-          <div class="card-header">
-            <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{score if score > 0 else '–'}</span>
-            <a href="{url}" class="job-title" target="_blank">{title}</a>
-          </div>
-          <div class="meta-row">{meta_html}</div>
-          {sub_pills_html}
-          {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
-          {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
-          {notes_html}
-          <p class="desc-preview">{desc_preview}...</p>
-          {drawers_html}
-          <div class="card-footer">{crm_controls_html}{apply_html}</div>
-        </div>"""
-
-    if current_score is not None:
-        job_sections += "</div>"
-
     active_prof = config.get_active_profile() or "default"
     prof_options_html = ""
     if interactive_api:
@@ -321,7 +146,7 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
             f'<select class="select-input" onchange="window.location.href=\'/?profile=\' + encodeURIComponent(this.value)">{opts_str}</select>'
         )
 
-    html = f"""<!DOCTYPE html>
+    html_head = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -464,7 +289,9 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
 <div id="job-count" class="job-count"></div>
 
 <div id="grid-container">
-{job_sections}
+"""
+
+    html_tail = """
 </div>
 
 <div id="kanban-container" class="kanban-board hidden">
@@ -482,160 +309,160 @@ let sponsorFilter = '';
 let arrFilter = '';
 let stageFilter = '';
 
-function filterScore(min, evt) {{
+function filterScore(min, evt) {
   minScore = min;
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
   if (evt && evt.target) evt.target.classList.add('active');
   applyFilters();
-}}
+}
 
-function filterSponsor(val) {{
+function filterSponsor(val) {
   sponsorFilter = val;
   applyFilters();
-}}
+}
 
-function filterArrangement(val) {{
+function filterArrangement(val) {
   arrFilter = val;
   applyFilters();
-}}
+}
 
-function filterStage(val) {{
+function filterStage(val) {
   stageFilter = val;
   applyFilters();
-}}
+}
 
-function filterText(text) {{
+function filterText(text) {
   searchText = text.toLowerCase();
   applyFilters();
-}}
+}
 
-async function updateJobStage(url, crm_stage) {{
-  try {{
-    const res = await fetch('/api/jobs/stage', {{
+async function updateJobStage(url, crm_stage) {
+  try {
+    const res = await fetch('/api/jobs/stage', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url, crm_stage}})
-    }});
-    if (res.ok) {{
-      document.querySelectorAll(`.job-card[data-url="${{CSS.escape(url)}}"]`).forEach(card => {{
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, crm_stage})
+    });
+    if (res.ok) {
+      document.querySelectorAll(`.job-card[data-url="${CSS.escape(url)}"]`).forEach(card => {
         card.dataset.stage = crm_stage;
-      }});
+      });
       if (isKanban) renderKanban();
-    }}
-  }} catch (e) {{ console.error(e); }}
-}}
+    }
+  } catch (e) { console.error(e); }
+}
 
-async function saveJobNote(url, user_notes) {{
-  try {{
-    await fetch('/api/jobs/notes', {{
+async function saveJobNote(url, user_notes) {
+  try {
+    await fetch('/api/jobs/notes', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url, user_notes}})
-    }});
-  }} catch (e) {{ console.error(e); }}
-}}
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, user_notes})
+    });
+  } catch (e) { console.error(e); }
+}
 
-async function generateProofPacket(url, btn) {{
+async function generateProofPacket(url, btn) {
   const orig = btn.textContent;
   btn.textContent = 'Building...';
   btn.disabled = true;
-  try {{
-    const res = await fetch('/api/jobs/proof', {{
+  try {
+    const res = await fetch('/api/jobs/proof', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url}})
-    }});
-    if (res.ok) {{
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url})
+    });
+    if (res.ok) {
       btn.textContent = '✓ Proof Saved';
-    }} else {{
+    } else {
       btn.textContent = orig;
       btn.disabled = false;
-    }}
-  }} catch (e) {{
+    }
+  } catch (e) {
     console.error(e);
     btn.textContent = orig;
     btn.disabled = false;
-  }}
-}}
+  }
+}
 
-async function syncInbox(btn) {{
+async function syncInbox(btn) {
   const orig = btn.textContent;
   btn.textContent = 'Syncing...';
   btn.disabled = true;
-  try {{
-    await fetch('/api/sync-email', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: '{{}}'}});
+  try {
+    await fetch('/api/sync-email', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
     window.location.reload();
-  }} catch (e) {{
+  } catch (e) {
     btn.textContent = orig;
     btn.disabled = false;
-  }}
-}}
+  }
+}
 
 let isKanban = false;
-function stageToBucket(st) {{
+function stageToBucket(st) {
   if (st === 'tailored' || st === 'ready' || st === 'ready_to_apply') return 'funnel_2';
   if (st === 'applied') return 'funnel_3';
   if (st === 'assessment' || st === 'interviewing') return 'funnel_4';
   if (st === 'offer' || st === 'rejected' || st === 'archived') return 'funnel_5';
   return 'funnel_1';
-}}
+}
 
-function renderKanban() {{
+function renderKanban() {
   document.querySelectorAll('#kanban-container .kanban-items').forEach(el => el.innerHTML = '');
-  document.querySelectorAll('#grid-container .job-card:not(.hidden)').forEach(card => {{
+  document.querySelectorAll('#grid-container .job-card:not(.hidden)').forEach(card => {
     const clone = card.cloneNode(true);
     const bucket = stageToBucket(card.dataset.stage || 'discovered');
-    const col = document.querySelector(`#kanban-container .kanban-col[data-bucket="${{bucket}}"] .kanban-items`);
+    const col = document.querySelector(`#kanban-container .kanban-col[data-bucket="${bucket}"] .kanban-items`);
     if (col) col.appendChild(clone);
-  }});
-}}
+  });
+}
 
-function toggleKanbanView() {{
+function toggleKanbanView() {
   isKanban = !isKanban;
   const grid = document.getElementById('grid-container');
   const kanban = document.getElementById('kanban-container');
   const btn = document.getElementById('view-toggle-btn');
-  if (isKanban) {{
+  if (isKanban) {
     grid.classList.add('hidden');
     kanban.classList.remove('hidden');
     btn.textContent = '📊 Score Grid';
     btn.classList.add('active');
     renderKanban();
-  }} else {{
+  } else {
     kanban.classList.add('hidden');
     grid.classList.remove('hidden');
     btn.textContent = '📋 Kanban Board';
     btn.classList.remove('active');
-  }}
-}}
+  }
+}
 
-async function generatePrepAndOutreach(url, btn) {{
+async function generatePrepAndOutreach(url, btn) {
   const orig = btn.textContent;
   btn.textContent = 'Generating...';
   btn.disabled = true;
-  try {{
-    await fetch('/api/jobs/prep', {{
+  try {
+    await fetch('/api/jobs/prep', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url}})
-    }});
-    await fetch('/api/jobs/outreach', {{
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url})
+    });
+    await fetch('/api/jobs/outreach', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{url}})
-    }});
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url})
+    });
     window.location.reload();
-  }} catch (e) {{
+  } catch (e) {
     console.error(e);
     btn.textContent = orig;
     btn.disabled = false;
-  }}
-}}
+  }
+}
 
-function applyFilters() {{
+function applyFilters() {
   let shown = 0;
   let total = 0;
-  document.querySelectorAll('.job-card').forEach(card => {{
+  document.querySelectorAll('.job-card').forEach(card => {
     total++;
     const score = parseInt(card.dataset.score) || 0;
     const text = card.textContent.toLowerCase();
@@ -647,24 +474,24 @@ function applyFilters() {{
     const spMatch = !sponsorFilter || (sp === 'licensed_sponsor' || sp === 'sponsorship_offered');
     const arrMatch = !arrFilter || arr === arrFilter;
     const stMatch = !stageFilter || st === stageFilter;
-    if (scoreMatch && textMatch && spMatch && arrMatch && stMatch) {{
+    if (scoreMatch && textMatch && spMatch && arrMatch && stMatch) {
       card.classList.remove('hidden');
       shown++;
-    }} else {{
+    } else {
       card.classList.add('hidden');
-    }}
-  }});
-  document.getElementById('job-count').textContent = `Showing ${{shown}} of ${{total}} jobs`;
-  document.querySelectorAll('.score-header').forEach(header => {{
+    }
+  });
+  document.getElementById('job-count').textContent = `Showing ${shown} of ${total} jobs`;
+  document.querySelectorAll('.score-header').forEach(header => {
     const grid = header.nextElementSibling;
-    if (grid && grid.classList.contains('job-grid')) {{
+    if (grid && grid.classList.contains('job-grid')) {
       const visible = grid.querySelectorAll('.job-card:not(.hidden)').length;
       header.style.display = visible ? '' : 'none';
       grid.style.display = visible ? '' : 'none';
-    }}
-  }});
+    }
+  });
   if (typeof isKanban !== 'undefined' && isKanban) renderKanban();
-}}
+}
 
 applyFilters();
 </script>
@@ -672,8 +499,193 @@ applyFilters();
 </body>
 </html>"""
 
+    # Stream the HTML to disk section by section instead of accumulating the
+    # full document in memory: the rendered body embeds every job's full
+    # description and generated documents, so peak memory now tracks a single
+    # job card rather than the whole database. The temp file plus atomic
+    # replace means readers never observe a partially written dashboard, and a
+    # failed render leaves the previous dashboard intact.
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(html, encoding="utf-8")
+    tmp_out = out.with_name(out.name + ".tmp")
+
+    handle = tmp_out.open("w", encoding="utf-8")
+    handle.write(html_head)
+    current_score = None
+    for j in jobs:
+        score = j["fit_score"] if j["fit_score"] is not None else 0
+        if score != current_score:
+            if current_score is not None:
+                handle.write("</div>")
+            score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#64748b")
+            score_label = {
+                10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
+                7: "Good Fit", 6: "Moderate+", 5: "Moderate", 0: "Unscored / Discovered",
+            }.get(score, f"Score {score}")
+            count_at_score = score_dist.get(score, 0) if score > 0 else (total - scored)
+            handle.write(f"""
+            <h2 class="score-header" style="border-color:{score_color}">
+              <span class="score-badge" style="background:{score_color}">{score if score > 0 else '–'}</span>
+              {score_label} ({count_at_score} jobs)
+            </h2>
+            <div class="job-grid">""")
+            current_score = score
+
+        title = escape(j["title"] or "Untitled")
+        company = escape(j["company"] or j["site"] or "Employer")
+        url = escape(j["url"] or "")
+        salary = escape(j["salary"] or "")
+        location = escape(j["location"] or "")
+        site = escape(j["site"] or "")
+        site_color = colors.get(j["site"] or "", "#60a5fa")
+        apply_url = escape(j["application_url"] or j["url"] or "")
+        sponsor_status = j["sponsor_status"] or "unknown"
+        work_arr = j["work_arrangement"] or "onsite"
+        crm_stage = j["crm_stage"] or "discovered"
+        ats_pct = j["ats_coverage_pct"]
+
+        reasoning_raw = j["score_reasoning"] or ""
+        reasoning_lines = reasoning_raw.split("\n")
+        keywords = reasoning_lines[0][:140] if reasoning_lines else ""
+        reasoning = reasoning_lines[1][:240] if len(reasoning_lines) > 1 else ""
+
+        sub_pills_html = ""
+        if j["score_breakdown"]:
+            try:
+                bd = json.loads(j["score_breakdown"])
+                sub_pills_html = (
+                    f'<div class="subscore-row">'
+                    f'<span class="sub-pill">Skills: {bd.get("skills_score", "-")}</span>'
+                    f'<span class="sub-pill">Quals: {bd.get("qualifications_score", "-")}</span>'
+                    f'<span class="sub-pill">Domain: {bd.get("domain_score", "-")}</span>'
+                    f'<span class="sub-pill">Loc/Visa: {bd.get("location_score", "-")}</span>'
+                    f"</div>"
+                )
+            except Exception:
+                pass
+
+        meta_parts = [
+            f'<span class="meta-tag company-tag">{company}</span>',
+            f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>',
+        ]
+        if salary:
+            meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
+        if location:
+            meta_parts.append(f'<span class="meta-tag location">{location[:42]}</span>')
+        if ats_pct is not None:
+            meta_parts.append(f'<span class="meta-tag ats-tag">ATS: {ats_pct}%</span>')
+        if sponsor_status == "sponsorship_offered":
+            meta_parts.append('<span class="meta-tag sponsor-yes">★ Visa Sponsorship Offered</span>')
+        elif sponsor_status == "licensed_sponsor":
+            meta_parts.append('<span class="meta-tag sponsor-lic">✓ Licensed UK/EU Sponsor</span>')
+        elif sponsor_status == "no_sponsorship_stated":
+            meta_parts.append('<span class="meta-tag sponsor-no">⚠ No Sponsorship Stated</span>')
+        meta_parts.append(f'<span class="meta-tag arr-tag">{escape(work_arr.title())}</span>')
+        meta_parts.append(f'<span class="meta-tag stage-tag">{escape(crm_stage.upper())}</span>')
+        meta_html = " ".join(meta_parts)
+
+        full_text = j["full_description"] or j["description"] or ""
+        desc_preview = escape(full_text)[:280]
+        full_desc_html = escape(full_text).replace("\n", "<br>")
+        desc_len = len(full_text)
+
+        tailored_txt = _read_optional_file(j["tailored_resume_path"])
+        cover_txt = _read_optional_file(j["cover_letter_path"])
+        prep_txt = _read_optional_file(j["prep_pack_path"])
+        outreach_txt = _read_optional_file(j["outreach_path"])
+
+        drawers_html = ""
+        if full_text:
+            drawers_html += (
+                f"<details class='full-desc-details'><summary class='expand-btn'>"
+                f"Full Description ({desc_len:,} chars)</summary>"
+                f"<div class='full-desc'>{full_desc_html}</div></details>"
+            )
+        if tailored_txt:
+            drawers_html += (
+                f"<details class='full-desc-details'><summary class='expand-btn'>"
+                f"Tailored CV Preview</summary>"
+                f"<div class='full-desc'>{escape(tailored_txt)}</div></details>"
+            )
+            if base_resume_txt:
+                drawers_html += (
+                    f"<details class='full-desc-details'><summary class='expand-btn'>"
+                    f"Base vs. Tailored CV Side-by-Side Diff</summary>"
+                    f"<div class='diff-grid'>"
+                    f"<div class='full-desc'><strong>Base CV</strong>\n\n{escape(base_resume_txt)}</div>"
+                    f"<div class='full-desc'><strong>Tailored CV (ATS: {ats_pct if ats_pct is not None else '-'}%)</strong>\n\n{escape(tailored_txt)}</div>"
+                    f"</div></details>"
+                )
+        if cover_txt:
+            drawers_html += (
+                f"<details class='full-desc-details'><summary class='expand-btn'>"
+                f"Cover Letter Preview</summary>"
+                f"<div class='full-desc'>{escape(cover_txt)}</div></details>"
+            )
+        if prep_txt:
+            drawers_html += (
+                f"<details class='full-desc-details'><summary class='expand-btn'>"
+                f"Interview Prep Dossier</summary>"
+                f"<div class='full-desc'>{escape(prep_txt)}</div></details>"
+            )
+        if outreach_txt:
+            drawers_html += (
+                f"<details class='full-desc-details'><summary class='expand-btn'>"
+                f"LinkedIn & Cold Email Outreach</summary>"
+                f"<div class='full-desc'>{escape(outreach_txt)}</div></details>"
+            )
+
+        user_notes_txt = escape(j["user_notes"] or "")
+        notes_html = f'<div class="notes-box">📝 {user_notes_txt}</div>' if user_notes_txt else ""
+        if interactive_api:
+            notes_html += (
+                f'<div class="notes-edit-row">'
+                f'<input type="text" class="search-input notes-input" placeholder="Add CRM note / follow-up..." value="{user_notes_txt}" '
+                f'onchange="saveJobNote(\'{url}\', this.value)">'
+                f'</div>'
+            )
+
+        crm_controls_html = ""
+        if interactive_api:
+            stages_list = [
+                "discovered", "enriched", "scored", "tailored",
+                "ready_to_apply", "applied", "assessment", "interviewing", "offer", "rejected", "archived",
+            ]
+            opts = "".join(
+                f'<option value="{st}" {"selected" if st == crm_stage else ""}>{st.upper()}</option>'
+                for st in stages_list
+            )
+            crm_controls_html = (
+                f'<select class="select-input stage-select" onchange="updateJobStage(\'{url}\', this.value)">{opts}</select>'
+                f'<button class="filter-btn" onclick="generatePrepAndOutreach(\'{url}\', this)">⚡ Prep & Outreach</button>'
+                f'<button class="filter-btn" onclick="generateProofPacket(\'{url}\', this)">🛡 Proof</button>'
+            )
+
+        apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>' if apply_url else ""
+
+        handle.write(f"""
+        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}"
+             data-location="{location.lower()}" data-sponsor="{escape(sponsor_status)}"
+             data-arrangement="{escape(work_arr)}" data-stage="{escape(crm_stage)}"
+             data-url="{url}">
+          <div class="card-header">
+            <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{score if score > 0 else '–'}</span>
+            <a href="{url}" class="job-title" target="_blank">{title}</a>
+          </div>
+          <div class="meta-row">{meta_html}</div>
+          {sub_pills_html}
+          {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
+          {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
+          {notes_html}
+          <p class="desc-preview">{desc_preview}...</p>
+          {drawers_html}
+          <div class="card-footer">{crm_controls_html}{apply_html}</div>
+        </div>""")
+
+    if current_score is not None:
+        handle.write("</div>")
+    handle.write(html_tail)
+    handle.close()
+    tmp_out.replace(out)
 
     abs_path = str(out.resolve())
     console.print(f"[green]Dashboard written to {abs_path}[/green]")

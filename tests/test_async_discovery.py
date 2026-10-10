@@ -250,3 +250,114 @@ async def test_workday_paginates_details_and_persists_one_page_at_a_time(
     assert limited["found"] == 23
     assert batch_sizes == [20, 3]
     assert offsets == [0, 20]
+
+
+@pytest.mark.asyncio
+async def test_workday_async_fetches_enforce_decompressed_byte_caps() -> None:
+    """Search and detail requests must refuse bodies beyond the Workday cap."""
+    from applypilot.discovery.workday import _MAX_WORKDAY_RESPONSE_BYTES
+    from applypilot.network import ResponseBodyTooLarge
+
+    employer: dict[str, Any] = {
+        "base_url": "https://example.wd5.myworkdayjobs.com",
+        "tenant": "Example",
+        "site_id": "Careers",
+    }
+
+    async def body_iterator() -> Any:
+        for _ in range(10):
+            yield b"z" * (_MAX_WORKDAY_RESPONSE_BYTES // 4)
+
+    def oversized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body_iterator(), request=request)
+
+    async with build_async_client(transport=httpx.MockTransport(oversized)) as client:
+        with pytest.raises(ResponseBodyTooLarge):
+            await workday_search_async(client, employer, "engineer")
+        with pytest.raises(ResponseBodyTooLarge):
+            await workday_detail_async(client, employer, "/job/42")
+
+
+@pytest.mark.asyncio
+async def test_workday_async_fetch_caps_gzip_bombs_with_small_content_length() -> None:
+    """A compressed Workday response declaring few bytes must still be capped after decoding."""
+    import gzip
+
+    from applypilot.network import ResponseBodyTooLarge
+
+    employer: dict[str, Any] = {
+        "base_url": "https://example.wd5.myworkdayjobs.com",
+        "tenant": "Example",
+        "site_id": "Careers",
+    }
+    raw = b'{"jobPostings": [{"title": "' + b"A" * 3_000_000 + b'"}]}'
+    compressed = gzip.compress(raw)
+    assert len(compressed) < 10_000  # declared transfer size looks harmless
+
+    def gz_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip", "Content-Length": str(len(compressed))},
+            content=compressed,
+            request=request,
+        )
+
+    async with build_async_client(transport=httpx.MockTransport(gz_handler)) as client:
+        with pytest.raises(ResponseBodyTooLarge):
+            await workday_search_async(client, employer, "engineer")
+
+
+@pytest.mark.asyncio
+async def test_ats_board_async_fetch_bounds_oversized_and_gzip_payloads() -> None:
+    """The pooled ATS fetch must degrade to an empty board instead of materializing huge bodies."""
+    import gzip
+
+    from applypilot.discovery.ats_direct import _MAX_BOARD_RESPONSE_BYTES, _scrape_single_ats_board_async
+
+    employer: dict[str, Any] = {"name": "Example", "token": "example"}
+    semaphore = asyncio.Semaphore(4)
+
+    async def body_iterator() -> Any:
+        for _ in range(10):
+            yield b"y" * (_MAX_BOARD_RESPONSE_BYTES // 4)
+
+    def oversized(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body_iterator(), request=request)
+
+    raw = json.dumps({"jobs": [{"title": "Engineer", "content": "A" * 3_000_000}]}).encode("utf-8")
+    compressed = gzip.compress(raw)
+    assert len(compressed) < 200_000
+
+    def gz_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Encoding": "gzip", "Content-Length": str(len(compressed))},
+            content=compressed,
+            request=request,
+        )
+
+    def healthy(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jobs": [{"title": "Engineer", "absolute_url": "https://boards.greenhouse.io/example/jobs/1"}]},
+            request=request,
+        )
+
+    async with build_async_client(transport=httpx.MockTransport(oversized)) as client:
+        result = await _scrape_single_ats_board_async(
+            client, semaphore, "greenhouse", employer, [], [], {}, []
+        )
+    assert result == ("greenhouse", "Example", [])
+
+    async with build_async_client(transport=httpx.MockTransport(gz_handler)) as client:
+        result = await _scrape_single_ats_board_async(
+            client, semaphore, "greenhouse", employer, [], [], {}, []
+        )
+    assert result == ("greenhouse", "Example", [])
+
+    async with build_async_client(transport=httpx.MockTransport(healthy)) as client:
+        platform, name, jobs = await _scrape_single_ats_board_async(
+            client, semaphore, "greenhouse", employer, [], [], {}, []
+        )
+    assert (platform, name) == ("greenhouse", "Example")
+    assert len(jobs) == 1

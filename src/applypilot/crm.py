@@ -27,6 +27,10 @@ from applypilot.view import generate_dashboard
 
 console = Console()
 
+
+class _RequestBodyTooLargeError(Exception):
+    """A CRM request declared a body beyond the configured cap."""
+
 VALID_CRM_STAGES: tuple[str, ...] = (
     "discovered",
     "enriched",
@@ -41,6 +45,11 @@ VALID_CRM_STAGES: tuple[str, ...] = (
     "rejected",
     "archived",
 )
+
+# Local CRM requests are small JSON documents (stage updates, notes, prep
+# triggers). Anything larger is rejected before the body is read so a
+# misbehaving client cannot pin handler memory.
+_MAX_REQUEST_BODY_BYTES = 1_000_000
 
 
 def update_job_crm_stage(
@@ -149,14 +158,37 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(404, {"error": "Not found"})
 
+    def _read_json_object_body(self) -> dict[str, Any]:
+        """Read the request body as a small JSON object.
+
+        Missing, empty, unparsable, or non-object bodies return ``{}`` so a
+        malformed request degrades to a validation error instead of crashing
+        the handler thread. Oversized bodies are refused with HTTP 413 before
+        any bytes are read.
+        """
+        length_header = self.headers.get("Content-Length", "0")
+        try:
+            length = int(length_header)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        if length > _MAX_REQUEST_BODY_BYTES:
+            raise _RequestBodyTooLargeError(length)
+        raw = self.rfile.read(length)
+        try:
+            decoded: Any = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", "0"))
-        body_raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
         try:
-            payload = json.loads(body_raw)
-        except Exception:
-            payload = {}
+            payload = self._read_json_object_body()
+        except _RequestBodyTooLargeError:
+            self._send_json(413, {"error": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"})
+            return
 
         if parsed.path == "/api/jobs/stage":
             url = str(payload.get("url") or "").strip()
@@ -164,6 +196,9 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
             notes = payload.get("user_notes")
             if not url or not stage:
                 self._send_json(400, {"error": "url and crm_stage are required"})
+                return
+            if notes is not None and not isinstance(notes, str):
+                self._send_json(400, {"error": "user_notes must be a string when provided"})
                 return
             try:
                 ok = update_job_crm_stage(url, stage, user_notes=notes)

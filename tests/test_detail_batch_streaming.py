@@ -271,3 +271,14 @@ def test_resolve_all_urls_processes_large_tables_in_bounded_rowid_batches(
         "SELECT COUNT(*) FROM jobs WHERE application_url LIKE 'apply/%'"
     ).fetchone()[0] == 0
     database.close_connection(tmp_path / "resolve.sqlite3")
+
+
+def test_algolia_capture_requires_bounded_declared_content_length() -> None:
+    """Unknown-size (chunked) or oversized Algolia responses are skipped before materialization."""
+    cap = detail._WTTJ_RESPONSE_MAX_CHARS
+    assert detail._algolia_capture_within_limit({"Content-Length": "12345"})
+    assert detail._algolia_capture_within_limit({"content-length": str(cap)})
+    assert not detail._algolia_capture_within_limit({"Content-Length": str(cap + 1)})
+    assert not detail._algolia_capture_within_limit({})  # chunked / unknown size
+    assert not detail._algolia_capture_within_limit({"Content-Length": "not-a-number"})
+    assert not detail._algolia_capture_within_limit({"Content-Length": "-5"})

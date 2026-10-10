@@ -329,3 +329,42 @@ def test_email_sync_lifecycle_and_native_proof_engine(tmp_path: Path, monkeypatc
     config.set_active_profile(None)
 
 
+
+
+def test_reset_transient_failed_jobs_processes_backlogs_in_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed-job scans must cross the 500-row window boundary without losing rows."""
+    monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
+    config.set_active_profile("reset-window-tests")
+    conn = database.init_db()
+
+    total = 1_200  # deliberately more than two 500-row windows
+    conn.executemany(
+        "INSERT INTO jobs (url, title, company, site, strategy, discovered_at, apply_error, apply_attempts) "
+        "VALUES (?, ?, 'Bulk Corp', 'indeed', 'jobspy', '2026-10-10', ?, 1)",
+        [
+            (
+                f"https://example.com/backlog-{index}",
+                f"Role {index}",
+                "RESULT:FAILED:timeout waiting for selector" if index % 2 == 0 else "not_eligible_location",
+            )
+            for index in range(total)
+        ],
+    )
+    conn.commit()
+
+    result = reset_transient_failed_jobs(conn=conn)
+
+    assert result["checked"] == total
+    assert result["reset_count"] == total // 2
+    assert result["by_bucket"]["retryable"] == total // 2
+    assert result["by_bucket"]["permanent_ineligible"] == total // 2
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE apply_error IS NOT NULL"
+    ).fetchone()[0]
+    assert remaining == total // 2
+
+    database.close_connection()
+    config.set_active_profile(None)

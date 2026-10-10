@@ -19,7 +19,6 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
 from urllib.parse import quote_plus
 
 import yaml
@@ -76,10 +75,10 @@ def _store_jobs_filtered(
     accept_locs: list[str],
     reject_locs: list[str],
 ) -> tuple[int, int]:
-    """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(UTC).isoformat()
-    new = 0
-    existing = 0
+    """Store jobs with location filtering and full v0.5 metadata enrichment. Returns (new, existing)."""
+    from applypilot.database import store_jobs
+
+    valid_jobs: list[dict] = []
     filtered = 0
 
     for job in jobs:
@@ -89,21 +88,13 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("company") or site, job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
-            existing += 1
+        valid_jobs.append(job)
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
-    conn.commit()
-    return new, existing
+    if not valid_jobs:
+        return (0, 0)
+    return store_jobs(conn, valid_jobs, site=site, strategy=strategy)
 
 
 # -- Page intelligence collector ---------------------------------------------

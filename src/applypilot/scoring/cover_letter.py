@@ -233,7 +233,14 @@ def run_cover_letters(
             cl_path = config.COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")
 
-            # Generate PDF (best-effort)
+            # Generate DOCX & PDF (best-effort)
+            docx_path = None
+            try:
+                from applypilot.scoring.docx_export import convert_to_docx
+                docx_path = str(convert_to_docx(cl_path, profile=profile))
+            except Exception:
+                log.debug("DOCX generation failed for %s", cl_path, exc_info=True)
+
             pdf_path = None
             try:
                 from applypilot.scoring.pdf import convert_to_pdf
@@ -245,6 +252,7 @@ def run_cover_letters(
                 "url": job["url"],
                 "path": str(cl_path),
                 "pdf_path": pdf_path,
+                "docx_path": docx_path,
                 "title": job.get("title", ""),
                 "site": job.get("site", ""),
             }
@@ -259,20 +267,23 @@ def run_cover_letters(
         except Exception as e:
             result = {
                 "url": job["url"], "title": job.get("title", ""), "site": job.get("site", ""),
-                "path": None, "pdf_path": None, "error": str(e),
+                "path": None, "pdf_path": None, "docx_path": None, "error": str(e),
             }
             error_count += 1
             results.append(result)
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), (job.get("title") or "")[:40], e)
 
+    from applypilot.database import ensure_columns
+    ensure_columns(conn)
     now = datetime.now(UTC).isoformat()
     saved = 0
     for r in results:
         if r.get("path"):
             conn.execute(
-                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, "
+                "UPDATE jobs SET cover_letter_path=?, cover_letter_at=?, docx_cover_path=?, "
+                "crm_stage = CASE WHEN crm_stage IN ('discovered', 'scored', 'tailored') OR crm_stage IS NULL THEN 'ready' ELSE crm_stage END, "
                 "cover_attempts=COALESCE(cover_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
+                (r["path"], now, r.get("docx_path"), r["url"]),
             )
             saved += 1
         else:

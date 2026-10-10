@@ -78,7 +78,7 @@
 
 ---
 
-## Phase 5: Automated Test Suite & CI Verification
+## Phase 5: Automated Test Suite & CI Verification (Completed)
 1. Create `tests/` with unit and integration tests covering:
    - Multi-profile isolation (`tahir` vs `neha`)
    - EU/UK location & title filtering and `country_indeed` resolution
@@ -86,3 +86,58 @@
    - Resume & Cover Letter HTML/PDF generation and HTML escaping
    - Database migrations (`company`, `pdf_generated_at`) and atomic `acquire_job` locking
 2. Update `.github/workflows/ci.yml` to run Ruff and Pytest on `push` and `pull_request`.
+
+---
+
+## Phase 6: Next-Gen Core Engine, Multi-Provider LLM & CLI Unification (`SPEC-05`)
+1. **`src/applypilot/pipeline.py` & `src/applypilot/cli.py`**:
+   - Define `ALL_STAGES` and `AI_STAGES` in `pipeline.py` and unify `run_pipeline()` signature with `cli.py:run()` (supporting `sources`, `limit`, `workers`, `dry_run`, `skip_*`, `validation_mode`, `deduplicate`, `export_docx`).
+   - Add `--workers / -w`, `--dry-run`, and `--all-profiles` flags to `applypilot run` and `applypilot status`.
+2. **`src/applypilot/llm.py`**:
+   - Add native support for **Anthropic Claude**, **OpenRouter**, **Groq**, and **DeepSeek** alongside **Gemini**, **OpenAI**, and **Local Ollama/llama.cpp**.
+   - Implement automatic multi-provider failover on HTTP 429/502/503 and track token/cost/latency telemetry (`get_telemetry()`).
+3. **`src/applypilot/wizard/importer.py`**:
+   - Add `applypilot init --from-resume <path>` to automatically parse an existing plain-text or PDF/DOCX CV into a complete `profile.json`, `resume.txt`, and `searches.yaml`.
+
+---
+
+## Phase 7: Direct ATS API Connectors, Cross-Board Deduplication & Sponsor Registry (`SPEC-06`)
+1. **`src/applypilot/discovery/ats_direct.py` & `config/employers.yaml`**:
+   - Implement zero-browser, zero-LLM direct API scrapers for **Greenhouse**, **Lever**, **Ashby**, and **SmartRecruiters** that pre-populate `full_description` and `application_url` at discovery time.
+   - Expand `employers.yaml` with `ats_employers` covering 40+ premier UK & EU FinTechs, Banks, AI labs, and Multinationals.
+2. **`src/applypilot/database.py`**:
+   - Add `fingerprint`, `sponsor_status`, `work_arrangement`, `ats_coverage_pct`, `score_breakdown`, `docx_resume_path`, `docx_cover_path`, `crm_stage`, `user_notes`, `prep_pack_path`, and `outreach_path` columns with automatic migration.
+   - Implement `compute_job_fingerprint()` and `deduplicate_jobs()` with direct-ATS prioritization and field merging.
+3. **`src/applypilot/enrichment/sponsors.py`**:
+   - Build the UK Home Office Skilled Worker & EU Recognized Sponsor Matcher (`evaluate_sponsorship_and_metadata()`), automatically tagging jobs with `sponsor_status`, `work_arrangement` (`remote`/`hybrid`/`onsite`), and expired-job detection.
+
+---
+
+## Phase 8: Explainable 4D Scoring, ATS Coverage Engine & Native `.docx` Export (`SPEC-05`)
+1. **`src/applypilot/scoring/ats.py`**:
+   - Build deterministic ATS keyword extractor and coverage calculator (`compute_ats_coverage()`) measuring baseline vs. tailored resume keyword overlap (`ats_coverage_pct` and `delta_pct`).
+2. **`src/applypilot/scoring/scorer.py` & `tailor.py`**:
+   - Upgrade `scorer.py` to output 4 sub-scores (`skills_score`, `qualifications_score`, `domain_score`, `location_score`), `matched_keywords`, and `missing_keywords` stored in `score_breakdown`.
+   - Pass missing ATS keywords from scoring into `tailor.py` and compute `ats_coverage_pct` upon tailoring completion.
+3. **`src/applypilot/scoring/docx_export.py` & `pdf.py`**:
+   - Build pure-Python OpenXML Word (`.docx`) exporter for tailored resumes and cover letters (`convert_resume_to_docx`, `convert_cover_letter_to_docx`, `batch_convert_docx`).
+   - Add selectable PDF themes (`modern`, `executive_uk_eu`, `compact_ats`) to `pdf.py`.
+
+---
+
+## Phase 9: Career CRM Server, Interview Prep, Recruiter Outreach & Apply Memory (`SPEC-07`)
+1. **`src/applypilot/crm.py` & `src/applypilot/view.py`**:
+   - Upgrade `view.py` dashboard with Company names, 4D Sub-Score pills, ATS Coverage badges, UK/EU Sponsor badges, Work Arrangement filters, CRM Kanban stages, Resume Diff & Cover Letter modal viewer, and client-side CSV export.
+   - Create `applypilot serve` (`crm.py`) running an interactive local Career CRM web server (`0.0.0.0`) with live stage updates, notes editing, and one-click Interview Prep / Outreach generation.
+2. **`src/applypilot/prep.py`**:
+   - Implement `applypilot prep` (Tailored Interview Prep Dossier with 8 role-specific questions + STAR answers grounded in `resume_facts`) and `applypilot outreach` (LinkedIn `<300` char connection note, Recruiter InMail, and Hiring Manager / Audit Partner cold email).
+3. **`src/applypilot/apply/memory.py`, `export.py` & `notifications.py`**:
+   - Implement persistent Screening Question Memory Bank (`question_bank` table + `applypilot memory` CLI) and Smart Error Classifier (`classify_apply_error` + `--retry-transient`).
+   - Implement `applypilot export` (`csv`, `json`, `markdown`) and `notifications.py` (Slack/Discord/Telegram webhook alerts).
+
+---
+
+## Phase 10: Comprehensive End-to-End Verification
+1. Add full unit & integration tests for all new modules (`test_ats_and_dedup.py`, `test_docx_and_ats_coverage.py`, `test_crm_prep_outreach_memory.py`, `test_cli_and_llm.py`).
+2. Run `ruff check` and `pytest -v` across the entire test suite with 100% pass rate.
+

@@ -281,6 +281,10 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
 
 def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
+    from applypilot.database import compute_job_fingerprint, ensure_columns
+    from applypilot.enrichment.sponsors import detect_sponsor_status, detect_work_arrangement
+
+    ensure_columns(conn)
     now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
@@ -302,14 +306,21 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
         site = job.get("employer_name", "Corporate")
         strategy = "workday_api"
+        title = job.get("title")
+        loc = job.get("location")
+        fp = compute_job_fingerprint(site, title, loc)
+        sponsor = detect_sponsor_status(site, title, full_description or short_desc, loc)
+        work_arr = detect_work_arrangement(title, loc, full_description or short_desc)
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), site, None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
+                "discovered_at, full_description, application_url, detail_scraped_at, detail_error, "
+                "fingerprint, sponsor_status, work_arrangement, crm_stage) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, site, None, short_desc, loc,
+                 site, strategy, now, full_description, url, detail_scraped_at, detail_error,
+                 fp, sponsor, work_arr, "discovered"),
             )
             new += 1
         except sqlite3.IntegrityError:

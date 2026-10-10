@@ -540,6 +540,9 @@ def build_prompt(
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section(redact_secrets=redact_secrets)
 
+    from applypilot.apply.memory import build_memory_prompt_section
+    memory_section = build_memory_prompt_section(profile=profile)
+
     city = personal.get("city", "the area")
     if not cover_letter_text:
         cl_display = (
@@ -611,6 +614,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 {salary_section}
 
 {screening_section}
+
+{memory_section}
 
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.

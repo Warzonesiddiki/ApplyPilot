@@ -386,22 +386,36 @@ def tailor_resume(
     max_retries: int = 3, validation_mode: str = "normal",
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry."""
+    from applypilot.scoring.ats import compute_ats_coverage
+
     company_name = job.get("company") or job.get("site") or "Unknown"
+    full_desc = job.get("full_description") or ""
     job_text = (
         f"TITLE: {job.get('title', 'Untitled')}\n"
         f"COMPANY: {company_name}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION:\n{full_desc[:6000]}"
     )
+
+    base_ats = compute_ats_coverage(full_desc, resume_text, profile=profile)
+    missing_ats_terms = base_ats.get("missing_keywords", [])[:10]
 
     report: dict = {
         "attempts": 0, "validator": None, "judge": None,
         "status": "pending", "validation_mode": validation_mode,
+        "base_ats_coverage": base_ats.get("coverage_pct", 100),
     }
     avoid_notes: list[str] = []
     tailored = ""
     client = get_client()
     tailor_prompt_base = _build_tailor_prompt(profile)
+    if missing_ats_terms:
+        tailor_prompt_base += (
+            "\n\n## ATS KEYWORD ALIGNMENT:\n"
+            f"Target JD keywords not yet verbatim in base resume: {', '.join(missing_ats_terms)}.\n"
+            "Where factually supported by the candidate's real experience and allowed skills boundary, "
+            "incorporate these exact JD terms naturally into the summary, skills, or bullets."
+        )
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
@@ -501,9 +515,15 @@ def run_tailoring(
 
     for completed, job in enumerate(jobs, 1):
         try:
-            tailored, report = tailor_resume(
-                resume_text, job, profile, validation_mode=validation_mode
+            from applypilot.scoring.ats import compute_ats_coverage, select_best_base_resume
+            best_res_txt, variant_name = select_best_base_resume(
+                job.get("full_description"), default_resume_path=config.RESUME_PATH, profile=profile
             )
+            job_base_resume = best_res_txt or resume_text
+            tailored, report = tailor_resume(
+                job_base_resume, job, profile, validation_mode=validation_mode
+            )
+            report["resume_variant"] = variant_name
 
             prefix = _build_file_prefix(job)
 
@@ -525,13 +545,25 @@ def run_tailoring(
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
+            # Compute deterministic ATS keyword coverage (base vs tailored)
+            ats_cov = compute_ats_coverage(
+                job.get("full_description"), tailored, base_resume=job_base_resume, profile=profile
+            )
+            report["ats_coverage"] = ats_cov
+
             # Save validation report
             report_path = config.TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # Generate PDF for approved resumes (best-effort)
+            # Generate PDF and DOCX for approved resumes (best-effort)
             pdf_path = None
+            docx_path = None
             if report["status"] in ("approved", "approved_with_judge_warning"):
+                try:
+                    from applypilot.scoring.docx_export import convert_to_docx
+                    docx_path = str(convert_to_docx(txt_path, profile=profile))
+                except Exception:
+                    log.debug("DOCX generation failed for %s", txt_path, exc_info=True)
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
@@ -542,6 +574,8 @@ def run_tailoring(
                 "url": job["url"],
                 "path": str(txt_path),
                 "pdf_path": pdf_path,
+                "docx_path": docx_path,
+                "ats_coverage_pct": ats_cov["coverage_pct"],
                 "title": job.get("title", ""),
                 "site": job.get("site", ""),
                 "status": report["status"],
@@ -550,7 +584,8 @@ def run_tailoring(
         except Exception as e:
             result = {
                 "url": job["url"], "title": job.get("title", ""), "site": job.get("site", ""),
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+                "status": "error", "attempts": 0, "path": None, "pdf_path": None, "docx_path": None,
+                "ats_coverage_pct": None,
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), (job.get("title") or "")[:40], e)
 
@@ -569,6 +604,8 @@ def run_tailoring(
         )
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
+    from applypilot.database import ensure_columns
+    ensure_columns(conn)
     now = datetime.now(UTC).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
@@ -576,8 +613,10 @@ def run_tailoring(
             pdf_gen_at = now if r.get("pdf_path") else None
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, pdf_generated_at=?, "
+                "docx_resume_path=?, ats_coverage_pct=?, "
+                "crm_stage = CASE WHEN crm_stage IN ('discovered', 'scored') OR crm_stage IS NULL THEN 'tailored' ELSE crm_stage END, "
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, pdf_gen_at, r["url"]),
+                (r["path"], now, pdf_gen_at, r.get("docx_path"), r.get("ats_coverage_pct"), r["url"]),
             )
         else:
             conn.execute(

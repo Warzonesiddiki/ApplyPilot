@@ -40,13 +40,18 @@ def _setup_resume() -> None:
             continue
 
         suffix = src.suffix.lower()
-        if suffix not in (".txt", ".pdf"):
-            console.print("[red]Unsupported format.[/red] Provide a .txt or .pdf file.")
+        if suffix not in (".txt", ".docx", ".md", ".pdf"):
+            console.print("[red]Unsupported format.[/red] Provide a .txt, .docx, .md, or .pdf file.")
             continue
 
         if suffix == ".txt":
             shutil.copy2(src, config.RESUME_PATH)
             console.print(f"[green]Copied to {config.RESUME_PATH}[/green]")
+        elif suffix in (".docx", ".md"):
+            from applypilot.wizard.importer import read_resume_file
+            extracted = read_resume_file(src)
+            config.RESUME_PATH.write_text(extracted, encoding="utf-8")
+            console.print(f"[green]Extracted text to {config.RESUME_PATH}[/green]")
         elif suffix == ".pdf":
             shutil.copy2(src, config.RESUME_PDF_PATH)
             console.print(f"[green]Copied to {config.RESUME_PDF_PATH}[/green]")
@@ -184,12 +189,17 @@ def _setup_profile() -> dict:
         "disability_status": "Decline to self-identify",
     }
 
-    # -- Availability --
+    # -- Availability & PDF Theme --
     earliest = Prompt.ask("Earliest start date / notice period", default="Immediately")
     profile["availability"] = {
         "earliest_start_date": earliest,
         "notice_period": earliest,
     }
+    profile["pdf_theme"] = Prompt.ask(
+        "Preferred PDF resume layout theme",
+        choices=["modern", "executive_uk_eu", "compact_ats"],
+        default="executive_uk_eu" if domain == "finance_accounting" else "modern",
+    )
 
     # Save with restricted permissions
     config.secure_write_text(
@@ -264,10 +274,13 @@ def _setup_ai_features() -> None:
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
+    console.print(
+        "Supported providers: [bold]Gemini[/bold] (recommended, free tier), "
+        "Anthropic Claude, OpenAI, OpenRouter, Groq, DeepSeek, or Local (Ollama/llama.cpp)"
+    )
     provider = Prompt.ask(
         "Provider",
-        choices=["gemini", "openai", "local"],
+        choices=["gemini", "anthropic", "openai", "openrouter", "groq", "deepseek", "local"],
         default="gemini",
     )
 
@@ -278,10 +291,30 @@ def _setup_ai_features() -> None:
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "anthropic":
+        api_key = Prompt.ask("Anthropic Claude API key", password=True)
+        model = Prompt.ask("Model", default="claude-3-5-haiku-latest")
+        env_lines.append(f"ANTHROPIC_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key", password=True)
         model = Prompt.ask("Model", default="gpt-4o-mini")
         env_lines.append(f"OPENAI_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "openrouter":
+        api_key = Prompt.ask("OpenRouter API key", password=True)
+        model = Prompt.ask("Model", default="google/gemini-2.0-flash-001")
+        env_lines.append(f"OPENROUTER_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "groq":
+        api_key = Prompt.ask("Groq API key", password=True)
+        model = Prompt.ask("Model", default="llama-3.3-70b-versatile")
+        env_lines.append(f"GROQ_API_KEY={api_key}")
+        env_lines.append(f"LLM_MODEL={model}")
+    elif provider == "deepseek":
+        api_key = Prompt.ask("DeepSeek API key", password=True)
+        model = Prompt.ask("Model", default="deepseek-chat")
+        env_lines.append(f"DEEPSEEK_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "local":
         url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")

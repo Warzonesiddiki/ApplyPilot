@@ -9,11 +9,13 @@ generating Interview Prep & Outreach packs on demand, and exporting CSV.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sqlite3
 from urllib.parse import parse_qs, urlparse
+from typing import Any
 
 from rich.console import Console
 
@@ -52,11 +54,12 @@ def update_job_crm_stage(
     if clean_stage not in VALID_CRM_STAGES:
         raise ValueError(f"Invalid CRM stage '{crm_stage}'. Must be one of: {', '.join(VALID_CRM_STAGES)}")
 
-    own_conn = conn is None
-    if own_conn:
+    if conn is None:
         conn = init_db()
+        own_conn = True
     else:
         ensure_columns(conn)
+        own_conn = False
 
     try:
         if user_notes is not None:
@@ -79,11 +82,12 @@ def update_job_crm_stage(
 class _CRMRequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for the local Career CRM web application."""
 
-    def log_message(self, format: str, *args) -> None:
+    def log_message(self, format: str, *args: object) -> None:
         return  # Keep console output clean
 
-    def _send_json(self, status: int, data: dict | list) -> None:
-        raw = json.dumps(data, indent=2).encode("utf-8")
+    def _send_json(self, status: int, data: Mapping[str, Any] | list[Any]) -> None:
+        payload: dict[str, Any] | list[Any] = dict(data) if isinstance(data, Mapping) else data
+        raw = json.dumps(payload, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))

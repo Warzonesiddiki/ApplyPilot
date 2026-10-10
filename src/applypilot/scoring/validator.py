@@ -8,8 +8,15 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any, TypedDict
 
 log = logging.getLogger(__name__)
+
+
+class ValidationResult(TypedDict):
+    passed: bool
+    errors: list[str]
+    warnings: list[str]
 
 
 # ── Universal Constants (not personal data) ───────────────────────────────
@@ -65,7 +72,7 @@ REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PRO
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def detect_profile_domain(profile: dict) -> str:
+def detect_profile_domain(profile: dict[str, Any]) -> str:
     """Detect the candidate's professional domain from their profile.
 
     Returns one of:
@@ -101,7 +108,7 @@ def detect_profile_domain(profile: dict) -> str:
     return "software_engineering"
 
 
-def _build_skills_set(profile: dict) -> set[str]:
+def _build_skills_set(profile: dict[str, Any]) -> set[str]:
     """Build the set of allowed skills and qualifications from the profile."""
     boundary = profile.get("skills_boundary", {})
     allowed: set[str] = set()
@@ -129,7 +136,7 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
-def _get_effective_watchlist(profile: dict, original_text: str = "") -> set[str]:
+def _get_effective_watchlist(profile: dict[str, Any], original_text: str = "") -> set[str]:
     """Return FABRICATION_WATCHLIST filtered by the user's actual skills and domain."""
     allowed = _build_skills_set(profile)
     domain = detect_profile_domain(profile)
@@ -174,7 +181,7 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+def validate_json_fields(data: dict[str, Any], profile: dict[str, Any], mode: str = "normal") -> ValidationResult:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -266,7 +273,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
 # ── Full Resume Text Validation ───────────────────────────────────────────
 
-def validate_tailored_resume(text: str, profile: dict, original_text: str = "") -> dict:
+def validate_tailored_resume(text: str, profile: dict[str, Any], original_text: str = "") -> ValidationResult:
     """Programmatic validation of a tailored resume against the user's profile."""
     errors: list[str] = []
     warnings: list[str] = []
@@ -375,7 +382,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
-def validate_cover_letter(text: str, mode: str = "normal") -> dict:
+def validate_cover_letter(text: str, mode: str = "normal") -> ValidationResult:
     """Programmatic validation of a cover letter."""
     errors: list[str] = []
     warnings: list[str] = []

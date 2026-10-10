@@ -15,6 +15,7 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import sqlite3
+from typing import Any
 
 import httpx
 
@@ -65,11 +66,11 @@ def extract_form_fields_from_html(html: str) -> list[dict[str, str]]:
 
 
 def build_application_payload(
-    job: dict,
-    profile: dict | None = None,
+    job: dict[str, Any],
+    profile: dict[str, Any] | None = None,
     detected_fields: list[dict[str, str]] | None = None,
     conn: sqlite3.Connection | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Build a complete, auditable application field payload and save a Proof Packet.
 
     Args:
@@ -81,11 +82,12 @@ def build_application_payload(
     Returns:
         Proof packet dictionary (also saved to `<PROOFS_DIR>/<prefix>_PROOF.json`).
     """
-    own_conn = conn is None
-    if own_conn:
+    if conn is None:
         conn = init_db()
+        own_conn = True
     else:
         ensure_columns(conn)
+        own_conn = False
 
     try:
         if profile is None:
@@ -191,13 +193,14 @@ def prepare_native_applications(
     limit: int = 10,
     fetch_live_forms: bool = False,
     conn: sqlite3.Connection | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Generate Pre-Submission Proof Packets for high-scoring jobs without requiring Claude CLI."""
-    own_conn = conn is None
-    if own_conn:
+    if conn is None:
         conn = init_db()
+        own_conn = True
     else:
         ensure_columns(conn)
+        own_conn = False
 
     try:
         profile = config.load_profile()
@@ -212,7 +215,7 @@ def prepare_native_applications(
             (min_score, limit),
         ).fetchall()
 
-        proofs: list[dict] = []
+        proofs: list[dict[str, Any]] = []
         for r in rows:
             job = dict(zip(r.keys(), r))
             detected: list[dict[str, str]] = []

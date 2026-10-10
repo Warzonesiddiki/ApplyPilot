@@ -7,40 +7,59 @@ Employer registry is loaded from config/employers.yaml instead of being
 hardcoded. Supports sequential search + detail fetching with proxy.
 """
 
-import json
+import asyncio
 import logging
 import re
 import sqlite3
 import time
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import AsyncIterator, Coroutine
 from datetime import UTC, datetime
 from html.parser import HTMLParser
+from typing import Any, TypeVar
+from urllib.parse import quote
+
+import httpx
 
 import yaml
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db
+from applypilot.database import close_connection, get_connection, init_db
+from applypilot.network import RetryPolicy, build_async_client, request_with_retry
 
 log = logging.getLogger(__name__)
 
 
 # -- Employer registry from YAML --------------------------------------------
 
-def load_employers() -> dict:
+def load_employers() -> dict[str, Any]:
     """Load Workday employer registry from config/employers.yaml."""
     path = CONFIG_DIR / "employers.yaml"
     if not path.exists():
         log.warning("employers.yaml not found at %s", path)
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("employers", {})
+    data: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        log.warning("Invalid employers.yaml: expected a top-level mapping")
+        return {}
+
+    raw_employers = data.get("employers", {})
+    if not isinstance(raw_employers, dict):
+        log.warning("Invalid employers.yaml: 'employers' must be a mapping")
+        return {}
+
+    employers: dict[str, Any] = {}
+    for employer_key, employer in raw_employers.items():
+        if not isinstance(employer_key, str) or not isinstance(employer, dict):
+            log.warning("Skipping invalid Workday employer entry %r", employer_key)
+            continue
+        employers[employer_key] = employer
+    return employers
 
 
 # -- Location filtering from search config -----------------------------------
 
-def _load_location_filter(search_cfg: dict | None = None):
+def _load_location_filter(search_cfg: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
     """Load location accept/reject lists from search config."""
     return config.load_location_filters(search_cfg)
 
@@ -55,24 +74,24 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 class _HTMLStripper(HTMLParser):
     """Strip HTML tags, keep text content."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self._parts: list[str] = []
         self._skip = False
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in ("script", "style"):
             self._skip = True
         elif tag in ("br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"):
             self._parts.append("\n")
 
-    def handle_endtag(self, tag):
+    def handle_endtag(self, tag: str) -> None:
         if tag in ("script", "style"):
             self._skip = False
         elif tag in ("p", "div", "li", "tr"):
             self._parts.append("\n")
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
         if not self._skip:
             self._parts.append(data)
 
@@ -94,90 +113,123 @@ def strip_html(html: str) -> str:
 
 # -- Proxy -------------------------------------------------------------------
 
-_opener = None
+_proxy_url: str | None = None
 
 
 def setup_proxy(proxy_str: str | None) -> None:
-    """Configure a global urllib opener with proxy support."""
-    global _opener
+    """Configure the proxy URL used by the synchronous and async HTTP clients."""
+    global _proxy_url
+    _proxy_url = None
     if not proxy_str:
-        _opener = urllib.request.build_opener()
         return
 
     parts = proxy_str.split(":")
     if len(parts) == 4:
-        host, port, user, passwd = parts
-        proxy_url = f"http://{user}:{passwd}@{host}:{port}"
+        host, port, user, password = parts
+        _proxy_url = f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
     elif len(parts) == 2:
-        proxy_url = f"http://{parts[0]}:{parts[1]}"
+        host, port = parts
+        _proxy_url = f"http://{host}:{port}"
     else:
-        log.warning("Proxy format not recognized: %s (expected host:port:user:pass or host:port)", proxy_str)
-        _opener = urllib.request.build_opener()
+        log.warning("Proxy format not recognized (expected host:port:user:pass or host:port)")
         return
-
-    proxy_handler = urllib.request.ProxyHandler({
-        "http": proxy_url,
-        "https": proxy_url,
-    })
-    _opener = urllib.request.build_opener(proxy_handler)
-    log.info("Proxy configured: %s:%s", parts[0], parts[1])
-
-
-def _urlopen(req, timeout=30):
-    """Open a URL using the configured opener (with or without proxy)."""
-    if _opener:
-        return _opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+    log.info("Proxy configured for Workday HTTP clients: %s:%s", parts[0], parts[1])
 
 
 # -- Workday API -------------------------------------------------------------
 
-def workday_search(employer: dict, search_text: str, limit: int = 20, offset: int = 0) -> dict:
-    """Search jobs via Workday CXS API. Returns JSON with total + jobPostings."""
+_WORKDAY_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_MAX_WORKDAY_CONCURRENCY = 32
+_DETAIL_WORKERS_PER_EMPLOYER = 4
+
+
+def _response_json_object(response: httpx.Response) -> dict[str, Any]:
+    """Decode a Workday response and reject non-object JSON payloads."""
+    payload: Any = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Workday API response must be a JSON object")
+    return payload
+
+
+def workday_search(employer: dict[str, Any], search_text: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    """Synchronous compatibility helper for a Workday CXS job search."""
     url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}/jobs"
-    payload = json.dumps({
-        "appliedFacets": {},
-        "limit": limit,
-        "offset": offset,
-        "searchText": search_text,
-    }).encode()
-
-    req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-
-    with _urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    payload = {"appliedFacets": {}, "limit": limit, "offset": offset, "searchText": search_text}
+    with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0), proxy=_proxy_url, follow_redirects=True) as client:
+        response = client.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _WORKDAY_UA},
+        )
+        response.raise_for_status()
+        return _response_json_object(response)
 
 
-def workday_detail(employer: dict, external_path: str) -> dict:
-    """Fetch full job detail via Workday CXS API."""
+def workday_detail(employer: dict[str, Any], external_path: str) -> dict[str, Any]:
+    """Synchronous compatibility helper for a Workday CXS detail request."""
     url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}{external_path}"
+    with httpx.Client(timeout=httpx.Timeout(30.0, connect=5.0), proxy=_proxy_url, follow_redirects=True) as client:
+        response = client.get(url, headers={"Accept": "application/json", "User-Agent": _WORKDAY_UA})
+        response.raise_for_status()
+        return _response_json_object(response)
 
-    req = urllib.request.Request(url)
-    req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-    with _urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+async def workday_search_async(
+    client: httpx.AsyncClient,
+    employer: dict[str, Any],
+    search_text: str,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Search Workday's CXS API without blocking the running event loop."""
+    url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}/jobs"
+    response = await request_with_retry(
+        client,
+        "POST",
+        url,
+        json={"appliedFacets": {}, "limit": limit, "offset": offset, "searchText": search_text},
+        headers={"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _WORKDAY_UA},
+        policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
+        logger=log,
+    )
+    response.raise_for_status()
+    return _response_json_object(response)
+
+
+async def workday_detail_async(
+    client: httpx.AsyncClient,
+    employer: dict[str, Any],
+    external_path: str,
+) -> dict[str, Any]:
+    """Fetch a Workday job detail using the shared async connection pool."""
+    url = f"{employer['base_url']}/wday/cxs/{employer['tenant']}/{employer['site_id']}{external_path}"
+    response = await request_with_retry(
+        client,
+        "GET",
+        url,
+        headers={"Accept": "application/json", "User-Agent": _WORKDAY_UA},
+        policy=RetryPolicy(max_attempts=4, base_delay=0.5, max_delay=15.0),
+        logger=log,
+    )
+    response.raise_for_status()
+    return _response_json_object(response)
 
 
 # -- Search + paginate -------------------------------------------------------
 
 def search_employer(
     employer_key: str,
-    employer: dict,
+    employer: dict[str, Any],
     search_text: str,
     location_filter: bool = True,
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Search an employer, paginate through all results, optionally filter by location."""
     log.info("%s: searching \"%s\"...", employer["name"], search_text)
 
-    all_jobs: list[dict] = []
+    all_jobs: list[dict[str, Any]] = []
     offset = 0
     page_size = 20
     max_pages = 25  # Cap at 500 results
@@ -231,7 +283,7 @@ def search_employer(
 
 # -- Fetch details -----------------------------------------------------------
 
-def _fetch_one_detail(employer: dict, job: dict) -> dict:
+def _fetch_one_detail(employer: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     """Fetch detail for a single job."""
     try:
         detail = workday_detail(employer, job["external_path"])
@@ -252,7 +304,7 @@ def _fetch_one_detail(employer: dict, job: dict) -> dict:
     return job
 
 
-def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
+def fetch_details(employer: dict[str, Any], jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fetch full description + apply URL for each job sequentially."""
     log.info("%s: fetching details for %d jobs...", employer["name"], len(jobs))
 
@@ -277,9 +329,251 @@ def fetch_details(employer: dict, jobs: list[dict]) -> list[dict]:
     return jobs
 
 
+async def _iter_search_employer_pages(
+    client: httpx.AsyncClient,
+    employer_key: str,
+    employer: dict[str, Any],
+    search_text: str,
+    location_filter: bool,
+    max_results: int,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> AsyncIterator[list[dict[str, Any]]]:
+    """Yield filtered search pages so details can be fetched and stored incrementally."""
+    log.info("%s: searching %r...", employer.get("name", employer_key), search_text)
+    offset = 0
+    page_size = 20
+    max_pages = 25
+    total: int | None = None
+    emitted = 0
+
+    for _ in range(max_pages):
+        try:
+            payload = await workday_search_async(client, employer, search_text, page_size, offset)
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            log.warning("%s: Workday API error at offset %d: %s", employer.get("name", employer_key), offset, exc)
+            break
+        if total is None:
+            total_value = payload.get("total") or 0
+            try:
+                total = int(total_value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Workday search response has an invalid total") from exc
+        postings = payload.get("jobPostings", [])
+        if not isinstance(postings, list) or not postings:
+            break
+
+        page_jobs: list[dict[str, Any]] = []
+        for posting in postings:
+            if not isinstance(posting, dict):
+                continue
+            location = str(posting.get("locationsText") or "")
+            if location_filter and not config.is_location_allowed(location, accept=accept_locs, reject=reject_locs):
+                continue
+            page_jobs.append(
+                {
+                    "title": str(posting.get("title") or ""),
+                    "location": location,
+                    "posted": str(posting.get("postedOn") or ""),
+                    "external_path": str(posting.get("externalPath") or ""),
+                    "employer_key": employer_key,
+                    "employer_name": str(employer.get("name") or employer_key),
+                }
+            )
+
+        if max_results > 0:
+            page_jobs = page_jobs[: max_results - emitted]
+        if page_jobs:
+            emitted += len(page_jobs)
+            yield page_jobs
+        offset += page_size
+        if offset >= (total or 0) or (max_results > 0 and emitted >= max_results):
+            break
+
+
+async def _search_employer_async(
+    client: httpx.AsyncClient,
+    employer_key: str,
+    employer: dict[str, Any],
+    search_text: str,
+    location_filter: bool,
+    max_results: int,
+    accept_locs: list[str],
+    reject_locs: list[str],
+) -> list[dict[str, Any]]:
+    """Collect all Workday search pages for compatibility with existing callers."""
+    jobs: list[dict[str, Any]] = []
+    async for page_jobs in _iter_search_employer_pages(
+        client,
+        employer_key,
+        employer,
+        search_text,
+        location_filter,
+        max_results,
+        accept_locs,
+        reject_locs,
+    ):
+        jobs.extend(page_jobs)
+    return jobs
+
+async def _fetch_one_detail_async(
+    client: httpx.AsyncClient,
+    employer: dict[str, Any],
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        detail = await workday_detail_async(client, employer, str(job["external_path"]))
+        info = detail.get("jobPostingInfo", {})
+        if not isinstance(info, dict):
+            raise ValueError("Workday response omitted jobPostingInfo")
+        job["full_description"] = strip_html(str(info.get("jobDescription") or ""))
+        job["apply_url"] = str(info.get("externalUrl") or "")
+        job["job_req_id"] = str(info.get("jobReqId") or "")
+        job["time_type"] = str(info.get("timeType") or "")
+        job["remote_type"] = str(info.get("remoteType") or "")
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        job["full_description"] = ""
+        job["apply_url"] = ""
+        job["detail_error"] = str(exc)
+    return job
+
+
+async def _fetch_details_async(
+    client: httpx.AsyncClient,
+    employer: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    semaphore: asyncio.Semaphore,
+) -> list[dict[str, Any]]:
+    if not jobs:
+        return []
+
+    results: list[dict[str, Any] | None] = [None] * len(jobs)
+    next_index = 0
+
+    async def fetch_worker() -> None:
+        nonlocal next_index
+        while next_index < len(jobs):
+            index = next_index
+            next_index += 1
+            async with semaphore:
+                results[index] = await _fetch_one_detail_async(client, employer, jobs[index])
+
+    worker_count = min(len(jobs), _DETAIL_WORKERS_PER_EMPLOYER)
+    await asyncio.gather(*(fetch_worker() for _ in range(worker_count)))
+    return [job for job in results if job is not None]
+
+
+def _store_workday_employer_results(
+    employer: dict[str, Any],
+    jobs: list[dict[str, Any]],
+    employers: dict[str, Any],
+) -> tuple[int, int]:
+    conn = init_db()
+    try:
+        return store_results(conn, jobs, employers)
+    finally:
+        close_connection()
+
+
+async def _scrape_employers_with_client(
+    client: httpx.AsyncClient,
+    search_text: str,
+    employers: dict[str, Any],
+    employer_keys: list[str],
+    location_filter: bool,
+    max_results: int,
+    accept_locs: list[str],
+    reject_locs: list[str],
+    workers: int,
+) -> dict[str, int]:
+    workers = max(1, min(workers, _MAX_WORKDAY_CONCURRENCY))
+    employer_semaphore = asyncio.Semaphore(workers)
+    detail_semaphore = asyncio.Semaphore(min(_MAX_WORKDAY_CONCURRENCY, workers * _DETAIL_WORKERS_PER_EMPLOYER))
+
+    async def process(employer_key: str) -> dict[str, int]:
+        employer = employers[employer_key]
+        totals = {"found": 0, "new": 0, "existing": 0, "errors": 0}
+        async with employer_semaphore:
+            try:
+                async for page_jobs in _iter_search_employer_pages(
+                    client,
+                    employer_key,
+                    employer,
+                    search_text,
+                    location_filter,
+                    max_results,
+                    accept_locs,
+                    reject_locs,
+                ):
+                    detailed_jobs = await _fetch_details_async(client, employer, page_jobs, detail_semaphore)
+                    totals["found"] += len(detailed_jobs)
+                    if detailed_jobs:
+                        new_count, existing_count = await asyncio.to_thread(
+                            _store_workday_employer_results, employer, detailed_jobs, employers
+                        )
+                        totals["new"] += new_count
+                        totals["existing"] += existing_count
+                return totals
+            except Exception:
+                log.exception("Workday employer worker failed for %s (%s)", employer_key, search_text)
+                totals["errors"] += 1
+                return totals
+
+    totals = {"found": 0, "new": 0, "existing": 0, "errors": 0}
+    next_index = 0
+
+    async def employer_worker() -> None:
+        nonlocal next_index
+        while next_index < len(employer_keys):
+            index = next_index
+            next_index += 1
+            result = await process(employer_keys[index])
+            for key in totals:
+                totals[key] += result[key]
+
+    worker_count = min(workers, len(employer_keys))
+    await asyncio.gather(*(employer_worker() for _ in range(worker_count)))
+    return totals
+
+
+async def scrape_employers_async(
+    search_text: str,
+    employers: dict[str, Any],
+    employer_keys: list[str] | None = None,
+    location_filter: bool = True,
+    max_results: int = 0,
+    accept_locs: list[str] | None = None,
+    reject_locs: list[str] | None = None,
+    workers: int = 1,
+) -> dict[str, int]:
+    """Async public Workday scraper with connection pooling and bounded concurrency."""
+    valid_keys = [key for key in (employer_keys or list(employers)) if key in employers]
+    if not valid_keys:
+        return {"found": 0, "new": 0, "existing": 0, "errors": 0}
+    concurrency = max(1, min(workers, len(valid_keys), _MAX_WORKDAY_CONCURRENCY))
+    async with build_async_client(
+        timeout=httpx.Timeout(30.0, connect=5.0),
+        max_connections=max(8, concurrency * 4),
+        max_keepalive_connections=max(4, concurrency * 2),
+        headers={"User-Agent": _WORKDAY_UA},
+        proxy=_proxy_url,
+    ) as client:
+        return await _scrape_employers_with_client(
+            client,
+            search_text,
+            employers,
+            valid_keys,
+            location_filter,
+            max_results,
+            accept_locs or [],
+            reject_locs or [],
+            concurrency,
+        )
+
+
 # -- DB storage --------------------------------------------------------------
 
-def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -> tuple[int, int]:
+def store_results(conn: sqlite3.Connection, jobs: list[dict[str, Any]], employers: dict[str, Any]) -> tuple[int, int]:
     """Store corporate jobs in DB. Returns (new, existing)."""
     from applypilot.database import compute_job_fingerprint, ensure_columns
     from applypilot.enrichment.sponsors import detect_sponsor_status, detect_work_arrangement
@@ -332,12 +626,12 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
 
 def _process_one(
     employer_key: str,
-    employers: dict,
+    employers: dict[str, Any],
     search_text: str,
     location_filter: bool,
     accept_locs: list[str],
     reject_locs: list[str],
-) -> dict:
+) -> dict[str, Any]:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
 
@@ -370,164 +664,109 @@ def _process_one(
             "found": len(jobs), "new": new, "existing": existing}
 
 
-# -- Main orchestrator -------------------------------------------------------
+# -- Public sync/async orchestrators ------------------------------------------
+
+_AsyncResult = TypeVar("_AsyncResult")
+
+
+def _run_async_sync(coroutine: Coroutine[Any, Any, _AsyncResult]) -> _AsyncResult:
+    """Run an async operation from the legacy synchronous CLI interface."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    raise RuntimeError("This synchronous Workday entry point cannot run inside an event loop; await its async variant")
+
 
 def scrape_employers(
     search_text: str,
-    employers: dict,
+    employers: dict[str, Any],
     employer_keys: list[str] | None = None,
     location_filter: bool = True,
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
     workers: int = 1,
-) -> dict:
-    """Run full scrape: search -> filter -> detail -> store.
-
-    Sequential by default. When workers > 1, processes employers in parallel
-    using ThreadPoolExecutor.
-    """
-    if employer_keys is None:
-        employer_keys = list(employers.keys())
-
-    if accept_locs is None:
-        accept_locs = []
-    if reject_locs is None:
-        reject_locs = []
-
-    # Ensure DB schema
-    init_db()
-
-    total_new = 0
-    total_existing = 0
-    total_found = 0
-    errors = 0
-    t0 = time.time()
-
-    valid_keys = [k for k in employer_keys if k in employers]
-
-    if workers > 1 and len(valid_keys) > 1:
-        # Parallel mode
-        completed = 0
-        with ThreadPoolExecutor(max_workers=min(workers, len(valid_keys))) as pool:
-            futures = {
-                pool.submit(
-                    _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
-                ): key
-                for key in valid_keys
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                completed += 1
-                total_new += result["new"]
-                total_existing += result["existing"]
-                total_found += result["found"]
-                if "error" in result:
-                    errors += 1
-
-                if completed % 10 == 0 or completed == len(valid_keys):
-                    elapsed = time.time() - t0
-                    log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
-                             search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
-    else:
-        # Sequential mode (default)
-        completed = 0
-        for key in valid_keys:
-            result = _process_one(
-                key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
-            )
-            completed += 1
-            total_new += result["new"]
-            total_existing += result["existing"]
-            total_found += result["found"]
-            if "error" in result:
-                errors += 1
-
-            if completed % 10 == 0 or completed == len(valid_keys):
-                elapsed = time.time() - t0
-                log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
-                         search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
-
-    elapsed = time.time() - t0
-    log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
-             search_text, total_found, total_new, total_existing, elapsed)
-
-    return {"found": total_found, "new": total_new, "existing": total_existing}
-
-
-# -- Public entry point ------------------------------------------------------
-
-def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> dict:
-    """Main entry point for Workday-based corporate job discovery.
-
-    Loads employer registry from config/employers.yaml (or uses the provided
-    dict), then loads search queries from the user's search config to run
-    a full crawl across all employers.
-
-    Args:
-        employers: Override the employer registry. If None, loads from YAML.
-        workers: Number of parallel threads for employer scraping. Default 1 (sequential).
-
-    Returns:
-        Dict with stats: found, new, existing, queries.
-    """
-    if employers is None:
-        employers = load_employers()
-
-    if not employers:
-        log.warning("No employers configured. Create config/employers.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
-
-    search_cfg = config.load_search_config()
-    queries_cfg = search_cfg.get("queries", [])
-    accept_locs, reject_locs = _load_location_filter(search_cfg)
-
-    # Default to tier 1-2 queries for workday scraping
-    max_tier = search_cfg.get("workday_max_tier", 2)
-    queries = [q["query"] for q in queries_cfg if q.get("tier", 99) <= max_tier]
-
-    if not queries:
-        # Fallback: use all queries
-        queries = [q["query"] for q in queries_cfg]
-
-    if not queries:
-        log.warning("No search queries configured in searches.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
-
-    proxy = search_cfg.get("proxy")
-    if proxy:
-        setup_proxy(proxy)
-
-    location_filter = search_cfg.get("workday_location_filter", True)
-
-    log.info("Workday crawl: %d queries x %d employers (workers=%d)", len(queries), len(employers), workers)
-
-    grand_new = 0
-    grand_existing = 0
-    grand_found = 0
-
-    for i, query in enumerate(queries, 1):
-        log.info("Query %d/%d: \"%s\"", i, len(queries), query)
-        result = scrape_employers(
-            search_text=query,
+) -> dict[str, int]:
+    """Backward-compatible synchronous wrapper for async Workday discovery."""
+    return _run_async_sync(
+        scrape_employers_async(
+            search_text=search_text,
             employers=employers,
+            employer_keys=employer_keys,
             location_filter=location_filter,
+            max_results=max_results,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
             workers=workers,
         )
-        grand_new += result["new"]
-        grand_existing += result["existing"]
-        grand_found += result["found"]
+    )
 
-    log.info("Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
-             grand_found, grand_new, grand_existing, len(queries), len(employers))
 
-    return {
-        "found": grand_found,
-        "new": grand_new,
-        "existing": grand_existing,
-        "queries": len(queries),
-    }
+async def run_workday_discovery_async(
+    employers: dict[str, Any] | None = None,
+    workers: int = 1,
+    search_cfg: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Async Workday crawl; shares one HTTP pool across queries and employers."""
+    if employers is None:
+        employers = await asyncio.to_thread(load_employers)
+    if not employers:
+        log.warning("No employers configured. Create config/employers.yaml.")
+        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+
+    if search_cfg is None:
+        loaded_search_cfg = await asyncio.to_thread(config.load_search_config)
+        search_cfg = loaded_search_cfg if isinstance(loaded_search_cfg, dict) else {}
+    resolved_search_cfg: dict[str, Any] = search_cfg
+    queries_cfg = resolved_search_cfg.get("queries", [])
+    accept_locs, reject_locs = config.load_location_filters(resolved_search_cfg)
+    max_tier = resolved_search_cfg.get("workday_max_tier", 2)
+    queries = [str(query["query"]) for query in queries_cfg if query.get("tier", 99) <= max_tier]
+    if not queries:
+        queries = [str(query["query"]) for query in queries_cfg if query.get("query")]
+    if not queries:
+        log.warning("No search queries configured in searches.yaml.")
+        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+
+    proxy = resolved_search_cfg.get("proxy")
+    if proxy:
+        setup_proxy(str(proxy))
+    location_filter = bool(resolved_search_cfg.get("workday_location_filter", True))
+    concurrency = max(1, min(workers, max(1, len(employers)), _MAX_WORKDAY_CONCURRENCY))
+    log.info("Workday crawl: %d queries x %d employers (workers=%d)", len(queries), len(employers), concurrency)
+
+    totals = {"found": 0, "new": 0, "existing": 0}
+    async with build_async_client(
+        timeout=httpx.Timeout(30.0, connect=5.0),
+        max_connections=max(8, concurrency * 4),
+        max_keepalive_connections=max(4, concurrency * 2),
+        headers={"User-Agent": _WORKDAY_UA},
+        proxy=_proxy_url,
+    ) as client:
+        for index, query in enumerate(queries, 1):
+            log.info("Query %d/%d: %r", index, len(queries), query)
+            result = await _scrape_employers_with_client(
+                client,
+                query,
+                employers,
+                list(employers),
+                location_filter,
+                0,
+                accept_locs,
+                reject_locs,
+                concurrency,
+            )
+            for key in totals:
+                totals[key] += result[key]
+
+    log.info(
+        "Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
+        totals["found"], totals["new"], totals["existing"], len(queries), len(employers),
+    )
+    return {**totals, "queries": len(queries)}
+
+
+def run_workday_discovery(employers: dict[str, Any] | None = None, workers: int = 1) -> dict[str, int]:
+    """Synchronous CLI entry point delegating all network work to asyncio."""
+    return _run_async_sync(run_workday_discovery_async(employers=employers, workers=workers))

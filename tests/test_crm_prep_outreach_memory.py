@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from typer.testing import CliRunner
 
 from applypilot import config, database
@@ -26,7 +28,7 @@ from applypilot.view import generate_dashboard
 runner = CliRunner()
 
 
-def test_interview_prep_and_outreach_pack_generation(tmp_path: Path, monkeypatch) -> None:
+def test_interview_prep_and_outreach_pack_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """generate_interview_prep and generate_outreach_pack create fact-grounded dossiers and <300 char notes."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     res = runner.invoke(app, ["init", "-p", "neha", "-t", "neha"])
@@ -71,7 +73,7 @@ def test_interview_prep_and_outreach_pack_generation(tmp_path: Path, monkeypatch
     config.set_active_profile(None)
 
 
-def test_screening_memory_bank_and_smart_transient_retry(tmp_path: Path, monkeypatch) -> None:
+def test_screening_memory_bank_and_smart_transient_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Question bank seeds from profile, supports upserts, and smart retry preserves permanent failures."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     runner.invoke(app, ["init", "-p", "tahir", "-t", "tahir"])
@@ -115,7 +117,7 @@ def test_screening_memory_bank_and_smart_transient_retry(tmp_path: Path, monkeyp
     config.set_active_profile(None)
 
 
-def test_crm_stage_export_dashboard_and_cli_commands(tmp_path: Path, monkeypatch) -> None:
+def test_crm_stage_export_dashboard_and_cli_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """CRM stage updates, multi-format export, dashboard generation, and CLI commands succeed end-to-end."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     runner.invoke(app, ["init", "-p", "neha", "-t", "neha"])
@@ -149,6 +151,9 @@ def test_crm_stage_export_dashboard_and_cli_commands(tmp_path: Path, monkeypatch
     md_path = export_jobs(fmt="markdown")
     assert csv_path.exists() and "Barclays" in csv_path.read_text(encoding="utf-8")
     assert json_path.exists() and "interviewing" in json_path.read_text(encoding="utf-8")
+    exported_json = json.loads(json_path.read_text(encoding="utf-8"))
+    assert len(exported_json) == 1
+    assert exported_json[0]["company"] == "Barclays"
     assert md_path.exists() and "92%" in md_path.read_text(encoding="utf-8")
 
     dash_path = Path(generate_dashboard())
@@ -177,7 +182,7 @@ def test_crm_stage_export_dashboard_and_cli_commands(tmp_path: Path, monkeypatch
     config.set_active_profile(None)
 
 
-def test_multi_provider_llm_detection_and_telemetry(monkeypatch) -> None:
+def test_multi_provider_llm_detection_and_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
     """_detect_all_providers detects Gemini, Anthropic, OpenAI, OpenRouter, Groq, and DeepSeek in order."""
     monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
@@ -195,7 +200,7 @@ def test_multi_provider_llm_detection_and_telemetry(monkeypatch) -> None:
     assert tel["calls"] == 0
 
 
-def test_email_sync_lifecycle_and_native_proof_engine(tmp_path: Path, monkeypatch) -> None:
+def test_email_sync_lifecycle_and_native_proof_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """sync_application_emails updates CRM stages & generates prep packs; native proof engine writes _PROOF.json."""
     from applypilot.apply.native_agent import extract_form_fields_from_html, prepare_native_applications
     from applypilot.email_sync import classify_application_email, sync_application_emails

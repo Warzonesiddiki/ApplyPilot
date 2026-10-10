@@ -16,10 +16,26 @@ import json
 import os
 import re
 import sqlite3
+from typing import Any, TypedDict
 
 from applypilot import config
 from applypilot.database import close_connection, ensure_columns, init_db
 from applypilot.prep import generate_interview_prep
+
+class EmailClassification(TypedDict):
+    event_type: str
+    crm_stage: str | None
+    confidence: float
+    matched_phrase: str | None
+
+
+class EmailSyncSummary(TypedDict):
+    scanned: int
+    matched: int
+    updated: int
+    prep_generated: int
+    events: list[dict[str, Any]]
+
 
 OFFER_PATTERNS: tuple[str, ...] = (
     "pleased to offer",
@@ -89,7 +105,7 @@ STAGE_PRIORITY: dict[str, int] = {
 }
 
 
-def classify_application_email(subject: str, body: str, sender: str = "") -> dict:
+def classify_application_email(subject: str, body: str, sender: str = "") -> EmailClassification:
     """Classify an email into a post-application CRM lifecycle event.
 
     Returns:
@@ -164,23 +180,21 @@ def match_email_to_job(
     subject: str,
     body: str,
     sender: str = "",
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Match an email against tracked jobs in SQLite by company name and role title."""
     ensure_columns(conn)
     rows = conn.execute(
-        "SELECT * FROM jobs ORDER BY COALESCE(fit_score, 0) DESC, discovered_at DESC"
-    ).fetchall()
-    if not rows:
-        return None
+        "SELECT url, company, title FROM jobs "
+        "ORDER BY COALESCE(fit_score, 0) DESC, discovered_at DESC"
+    )
 
     haystack = f"{subject} {sender} {body}".lower()
-    best_row = None
+    best_url: str | None = None
     best_score = 0
 
-    for r in rows:
-        row_dict = dict(zip(r.keys(), r))
-        company = (row_dict.get("company") or "").strip()
-        title = (row_dict.get("title") or "").strip()
+    for row in rows:
+        company = (row["company"] or "").strip()
+        title = (row["title"] or "").strip()
         norm_comp = _normalize_company_token(company)
         if not norm_comp or len(norm_comp) < 2:
             continue
@@ -203,12 +217,24 @@ def match_email_to_job(
 
         if score > best_score:
             best_score = score
-            best_row = row_dict
+            best_url = str(row["url"])
 
-    return best_row
+    if best_url is None:
+        return None
+    best_row = conn.execute("SELECT * FROM jobs WHERE url = ?", (best_url,)).fetchone()
+    return dict(best_row) if best_row is not None else None
 
 
-def fetch_imap_messages(limit: int = 30) -> list[dict]:
+def _decode_mime_payload(payload: object) -> str:
+    """Decode a MIME payload when it is bytes or text; ignore nested message objects."""
+    if isinstance(payload, bytes):
+        return payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        return payload
+    return ""
+
+
+def fetch_imap_messages(limit: int = 30) -> list[dict[str, str]]:
     """Fetch recent recruiting emails via IMAP if IMAP_USER and IMAP_PASSWORD are set."""
     config.load_env()
     host = os.environ.get("IMAP_HOST", "imap.gmail.com")
@@ -217,7 +243,7 @@ def fetch_imap_messages(limit: int = 30) -> list[dict]:
     if not user or not password:
         return []
 
-    messages: list[dict] = []
+    messages: list[dict[str, str]] = []
     try:
         with imaplib.IMAP4_SSL(host) as mail:
             mail.login(user, password)
@@ -242,13 +268,9 @@ def fetch_imap_messages(limit: int = 30) -> list[dict]:
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == "text/plain":
-                            payload = part.get_payload(decode=True)
-                            if payload:
-                                body_text += payload.decode("utf-8", errors="replace")
+                            body_text += _decode_mime_payload(part.get_payload(decode=True))
                 else:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        body_text = payload.decode("utf-8", errors="replace")
+                    body_text = _decode_mime_payload(msg.get_payload(decode=True))
                 messages.append({"subject": subj, "sender": sender, "body": body_text[:4000]})
     except Exception:
         return []
@@ -256,11 +278,11 @@ def fetch_imap_messages(limit: int = 30) -> list[dict]:
 
 
 def sync_application_emails(
-    messages: list[dict] | None = None,
+    messages: list[dict[str, Any]] | None = None,
     inbox_file: str | None = None,
     auto_prep_on_interview: bool = True,
     conn: sqlite3.Connection | None = None,
-) -> dict:
+) -> EmailSyncSummary:
     """Process recruiting emails and update job CRM stages and interview prep packs.
 
     Args:
@@ -272,11 +294,12 @@ def sync_application_emails(
     Returns:
         Summary dictionary with counts and updated job records.
     """
-    own_conn = conn is None
-    if own_conn:
+    if conn is None:
         conn = init_db()
+        own_conn = True
     else:
         ensure_columns(conn)
+        own_conn = False
 
     try:
         if messages is None:
@@ -290,7 +313,7 @@ def sync_application_emails(
             else:
                 messages = fetch_imap_messages()
 
-        summary: dict = {
+        summary: EmailSyncSummary = {
             "scanned": len(messages or []),
             "matched": 0,
             "updated": 0,

@@ -9,6 +9,7 @@ as well as Software/AI/Data Engineering.
 from __future__ import annotations
 
 import re
+from typing import Any, NotRequired, TypedDict
 
 # Canonical ATS keyword taxonomy: (display_label, regex_pattern)
 _CANONICAL_KEYWORDS: tuple[tuple[str, str], ...] = (
@@ -127,20 +128,31 @@ _CANONICAL_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("dbt", r"\bdbt\b"),
 )
 
-_COMPILED_KEYWORDS: list[tuple[str, re.Pattern]] = [
+class ATSCoverageResult(TypedDict):
+    coverage_pct: int
+    baseline_pct: int
+    delta_pct: int
+    matched_keywords: list[str]
+    missing_keywords: list[str]
+    matched: NotRequired[list[str]]
+    missing: NotRequired[list[str]]
+    total_jd_keywords: int
+
+
+_COMPILED_KEYWORDS: list[tuple[str, re.Pattern[str]]] = [
     (label, re.compile(pat, re.IGNORECASE)) for label, pat in _CANONICAL_KEYWORDS
 ]
 
 
 def extract_jd_keywords(
     job_description: str | None,
-    profile: dict | None = None,
-) -> list[tuple[str, re.Pattern]]:
+    profile: dict[str, Any] | None = None,
+) -> list[tuple[str, re.Pattern[str]]]:
     """Extract canonical + profile-boundary ATS keywords present in a job description."""
     if not job_description:
         return []
 
-    found: list[tuple[str, re.Pattern]] = []
+    found: list[tuple[str, re.Pattern[str]]] = []
     seen_labels: set[str] = set()
 
     for label, pat in _COMPILED_KEYWORDS:
@@ -169,8 +181,8 @@ def compute_ats_coverage(
     job_description: str | None,
     tailored_resume: str | None,
     base_resume: str | None = None,
-    profile: dict | None = None,
-) -> dict:
+    profile: dict[str, Any] | None = None,
+) -> ATSCoverageResult:
     """Compute deterministic ATS keyword coverage for a tailored resume vs. a job description.
 
     Returns:
@@ -228,7 +240,7 @@ def compute_ats_coverage(
 def select_best_base_resume(
     job_description: str | None,
     default_resume_path: object | None = None,
-    profile: dict | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Select the highest-ATS-coverage base resume variant for a job description.
 

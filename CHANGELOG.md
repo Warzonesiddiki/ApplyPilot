@@ -5,6 +5,21 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Project-wide strict mypy, Ruff async checks, and pytest-cov tooling with pandas/YAML stubs, configured for all 42 source and 15 test modules.
+- Shared async HTTP pooling/retry utilities, bounded Workday and ATS concurrency, and regression coverage for non-blocking discovery and OpenAI structured-output fallbacks.
+
+### Changed
+- Hardened SQLite write serialization, YAML configuration validation, response-size limits, and provider/browser resource handling.
+- Streamed ATS, Workday, detail-enrichment, scoring, smart extraction, URL resolution, deduplication, and file exports in bounded batches instead of retaining entire result sets.
+- Capped browser scraper fan-out, reused the scoring worker pool across batches, and included jobs with missing source labels in detail enrichment.
+- Capped the LLM cache by both entry count and UTF-8 bytes; lazily allocate the synchronous client so async-only use does not leak an unused pool.
+
+### Fixed
+- Restored the setup wizard's public resume-file reader and tightened runtime handling of subprocess pipes, MIME payloads, and malformed API/config data.
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

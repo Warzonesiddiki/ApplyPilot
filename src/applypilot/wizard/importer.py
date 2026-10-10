@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 import zipfile
+from typing import Any
 
 import yaml
 
@@ -36,7 +37,12 @@ def _read_resume_file(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def parse_resume_to_profile_and_searches(resume_text: str) -> tuple[dict, dict]:
+def read_resume_file(path: Path | str) -> str:
+    """Read a supported resume file for the interactive setup wizard."""
+    return _read_resume_file(Path(path))
+
+
+def parse_resume_to_profile_and_searches(resume_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Deterministically parse a resume text into `(profile_dict, searches_dict)`."""
     parsed = parse_resume(resume_text)
     full_name = parsed.get("name") or "Candidate"
@@ -190,14 +196,14 @@ def parse_resume_to_profile_and_searches(resume_text: str) -> tuple[dict, dict]:
     return profile_data, searches_data
 
 
-def import_from_resume_file(resume_file: Path | str) -> dict:
+def import_from_resume_file(resume_file: Path | str) -> dict[str, Any]:
     """Import a resume file (`.txt` or `.docx`) and write `profile.json`, `resume.txt`, and `searches.yaml`."""
     src = Path(resume_file)
     if not src.exists():
         raise FileNotFoundError(f"Resume file not found: {src}")
 
     config.ensure_dirs()
-    resume_text = _read_resume_file(src)
+    resume_text = read_resume_file(src)
     profile_data, searches_data = parse_resume_to_profile_and_searches(resume_text)
 
     config.RESUME_PATH.write_text(resume_text, encoding="utf-8")

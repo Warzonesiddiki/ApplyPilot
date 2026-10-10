@@ -13,10 +13,12 @@ import logging
 import re
 import time
 from datetime import UTC, datetime
+from typing import Any
 
 from applypilot import config
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.schemas import ResumeJudgeResponse, TailoredResumeResponse
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     detect_profile_domain,
@@ -31,7 +33,7 @@ MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 # ── Prompt Builders (profile-driven & domain-adaptive) ────────────────────
 
-def _build_tailor_prompt(profile: dict) -> str:
+def _build_tailor_prompt(profile: dict[str, Any]) -> str:
     """Build the resume tailoring system prompt from the user's profile."""
     domain = detect_profile_domain(profile)
     boundary = profile.get("skills_boundary", {})
@@ -146,7 +148,7 @@ BULLETS: Strong action verb + what you delivered + quantified impact. Vary verbs
 {{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{skills_json_str},"experience":[{{"header":"Title at Company","subtitle":"Location / Scope | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"certifications":"{certs_str}","education":"{edu_default}"}}"""
 
 
-def _build_judge_prompt(profile: dict) -> str:
+def _build_judge_prompt(profile: dict[str, Any]) -> str:
     """Build the LLM judge prompt from the user's profile."""
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
@@ -164,9 +166,7 @@ def _build_judge_prompt(profile: dict) -> str:
 
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
 
-You must answer with EXACTLY this format:
-VERDICT: PASS or FAIL
-ISSUES: (list any problems, or "none")
+Return one JSON object with exactly these keys: "verdict" ("PASS" or "FAIL") and "issues" (string; use "none" when clear). Do not include Markdown or commentary.
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
 - Change the title to match the target role
@@ -203,54 +203,9 @@ The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 m
 Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
 
 
-# ── JSON Extraction ───────────────────────────────────────────────────────
-
-def extract_json(raw: str) -> dict:
-    """Robustly extract JSON from LLM response (handles fences, preamble).
-
-    Args:
-        raw: Raw LLM response text.
-
-    Returns:
-        Parsed JSON dict.
-
-    Raises:
-        ValueError: If no valid JSON found.
-    """
-    raw = raw.strip()
-
-    # Direct parse
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # Markdown fences
-    if "```" in raw:
-        for part in raw.split("```")[1::2]:
-            part = part.strip()
-            if part.startswith("json"):
-                part = part[4:].strip()
-            try:
-                return json.loads(part)
-            except json.JSONDecodeError:
-                continue
-
-    # Find outermost { ... }
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(raw[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError("No valid JSON found in LLM response")
-
-
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
-def assemble_resume_text(data: dict, profile: dict) -> str:
+def assemble_resume_text(data: dict[str, Any], profile: dict[str, Any]) -> str:
     """Convert JSON resume data to formatted plain text.
 
     Header (name, location, contact) is ALWAYS code-injected from the profile,
@@ -347,8 +302,8 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 # ── LLM Judge ────────────────────────────────────────────────────────────
 
 def judge_tailored_resume(
-    original_text: str, tailored_text: str, job_title: str, profile: dict
-) -> dict:
+    original_text: str, tailored_text: str, job_title: str, profile: dict[str, Any]
+) -> dict[str, Any]:
     """LLM judge layer: catches subtle fabrication that programmatic checks miss."""
     judge_prompt = _build_judge_prompt(profile)
 
@@ -363,28 +318,25 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
-
-    passed = "VERDICT: PASS" in response.upper()
-    issues = "none"
-    if "ISSUES:" in response.upper():
-        issues_idx = response.upper().index("ISSUES:")
-        issues = response[issues_idx + 7:].strip()
-
+    response = client.structured_chat(
+        messages,
+        response_model=ResumeJudgeResponse,
+        max_tokens=512,
+        temperature=0.1,
+    )
     return {
-        "passed": passed,
-        "verdict": "PASS" if passed else "FAIL",
-        "issues": issues,
-        "raw": response,
+        "passed": response.verdict == "PASS",
+        "verdict": response.verdict,
+        "issues": response.issues,
     }
 
 
 # ── Core Tailoring ───────────────────────────────────────────────────────
 
 def tailor_resume(
-    resume_text: str, job: dict, profile: dict,
+    resume_text: str, job: dict[str, Any], profile: dict[str, Any],
     max_retries: int = 3, validation_mode: str = "normal",
-) -> tuple[str, dict]:
+) -> tuple[str, dict[str, Any]]:
     """Generate a tailored resume via JSON output + fresh context on each retry."""
     from applypilot.scoring.ats import compute_ats_coverage
 
@@ -400,7 +352,7 @@ def tailor_resume(
     base_ats = compute_ats_coverage(full_desc, resume_text, profile=profile)
     missing_ats_terms = base_ats.get("missing_keywords", [])[:10]
 
-    report: dict = {
+    report: dict[str, Any] = {
         "attempts": 0, "validator": None, "judge": None,
         "status": "pending", "validation_mode": validation_mode,
         "base_ats_coverage": base_ats.get("coverage_pct", 100),
@@ -431,13 +383,13 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
-
-        try:
-            data = extract_json(raw)
-        except ValueError:
-            avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
-            continue
+        structured = client.structured_chat(
+            messages,
+            response_model=TailoredResumeResponse,
+            max_tokens=2048,
+            temperature=0.4,
+        )
+        data = structured.model_dump()
 
         # Layer 1: Validate JSON fields
         validation = validate_json_fields(data, profile, mode=validation_mode)
@@ -479,12 +431,12 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def _build_file_prefix(job: dict) -> str:
+def _build_file_prefix(job: dict[str, Any]) -> str:
     """Build a collision-free filename prefix using company/site, title, and short URL hash."""
     company = job.get("company") or job.get("site") or "Job"
     title = job.get("title") or "Role"
     url = job.get("url") or f"{company}_{title}"
-    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:6]
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
 
     safe_title = re.sub(r"[^\w\s-]", "", title)[:45].strip().replace(" ", "_")
     safe_company = re.sub(r"[^\w\s-]", "", company)[:20].strip().replace(" ", "_")
@@ -495,7 +447,7 @@ def run_tailoring(
     min_score: int = 7,
     limit: int = 20,
     validation_mode: str = "normal",
-) -> dict:
+) -> dict[str, Any]:
     """Generate tailored resumes for high-scoring jobs."""
     profile = config.load_profile()
     resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
@@ -510,7 +462,7 @@ def run_tailoring(
     config.TAILORED_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
     t0 = time.time()
-    results: list[dict] = []
+    results: list[dict[str, Any]] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
     for completed, job in enumerate(jobs, 1):

@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 
 from applypilot import config, database
 from applypilot.discovery.ats_direct import (
@@ -130,7 +131,10 @@ def test_parse_greenhouse_lever_ashby_and_smartrecruiters() -> None:
     assert r_jobs[0]["url"] == "https://mollie.recruitee.com/o/group-consolidation-ifrs-707"
 
 
-def test_run_ats_direct_discovery_with_mock_http(tmp_path: Path, monkeypatch) -> None:
+def test_run_ats_direct_discovery_with_mock_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """run_ats_direct_discovery ingests pre-enriched jobs into SQLite without browser or LLM."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     config.set_active_profile("neha")
@@ -167,7 +171,10 @@ def test_run_ats_direct_discovery_with_mock_http(tmp_path: Path, monkeypatch) ->
     config.set_active_profile(None)
 
 
-def test_cross_board_fuzzy_deduplication_prioritizes_direct_ats(tmp_path: Path, monkeypatch) -> None:
+def test_cross_board_fuzzy_deduplication_prioritizes_direct_ats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """deduplicate_jobs merges aggregator duplicates into the direct ATS listing and preserves metadata."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
     config.set_active_profile(None)
@@ -256,3 +263,60 @@ def test_uk_eu_sponsor_and_expired_detection() -> None:
     assert meta["work_arrangement"] == "hybrid"
     assert "ACA" in meta["qualifications"]
     assert "IFRS" in meta["qualifications"]
+
+
+def test_deduplicate_backfills_missing_fingerprints_without_merging_unknowns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
+    config.set_active_profile(None)
+    conn = database.init_db()
+    database.store_jobs(
+        conn,
+        jobs=[
+            {
+                "url": "https://jobs.example.test/finance-1",
+                "title": "Finance Analyst",
+                "company": "Example Corp",
+                "location": "Mumbai, India",
+            },
+            {
+                "url": "https://jobs.example.test/finance-2",
+                "title": "Finance Analyst",
+                "company": "Example Corp",
+                "location": "Mumbai, India",
+                "salary": "₹20,00,000",
+            },
+            {
+                "url": "https://jobs.example.test/unknown-1",
+                "title": "",
+                "company": "",
+                "location": "",
+            },
+            {
+                "url": "https://jobs.example.test/unknown-2",
+                "title": "",
+                "company": "",
+                "location": "",
+            },
+        ],
+        site="example",
+        strategy="example_api",
+    )
+    conn.execute("UPDATE jobs SET fingerprint = NULL")
+    conn.commit()
+
+    summary = database.deduplicate_jobs(conn)
+
+    assert summary == {"checked": 4, "duplicates_removed": 1, "groups_merged": 1}
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 3
+    assert (
+        conn.execute(
+            "SELECT salary FROM jobs WHERE url = ?",
+            ("https://jobs.example.test/finance-1",),
+        ).fetchone()[0]
+        == "₹20,00,000"
+    )
+    database.close_connection()
+    config.set_active_profile(None)

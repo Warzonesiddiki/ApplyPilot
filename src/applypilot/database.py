@@ -7,60 +7,216 @@ without migration ordering issues.
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, BinaryIO, Protocol, cast
 
 from applypilot import config
 
-# Thread-local connection storage — each thread gets its own connection
-# (required for SQLite thread safety with parallel workers)
+# Thread-local connection storage — each thread gets its own connection.
 _local = threading.local()
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
+_SQLITE_LOCK_TIMEOUT_SECONDS = 30.0
+JobRecord = dict[str, Any]
+DatabaseStats = dict[str, Any]
+
+
+class _MsvcrtLocking(Protocol):
+    """Subset of the Windows ``msvcrt`` API used for writer locking."""
+
+    LK_NBLCK: int
+    LK_UNLCK: int
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None: ...
+
+
+def _get_msvcrt_locking() -> _MsvcrtLocking:
+    """Import the Windows-only locking API behind a portable type contract."""
+    import msvcrt
+
+    return cast(_MsvcrtLocking, msvcrt)
+
+
+class _SerializedSQLiteConnection(sqlite3.Connection):
+    """SQLite connection that serializes write transactions across processes.
+
+    SQLite remains responsible for its own database-level locking. This
+    advisory lock gives writers a consistent acquisition order across ApplyPilot
+    workers and separate processes, while `busy_timeout` remains a final guard
+    for other SQLite clients that do not use the lock file.
+    """
+
+    def __init__(self, database: str | bytes, *args: Any, **kwargs: Any) -> None:
+        self._database_path = os.fsdecode(database)
+        self._writer_lock_handle: BinaryIO | None = None
+        super().__init__(database, *args, **kwargs)
+
+    @staticmethod
+    def _is_read_only(statement: str) -> bool:
+        """Conservatively classify SQL that cannot mutate database state."""
+        sql = statement.lstrip()
+        while sql.startswith("--") or sql.startswith("/*"):
+            if sql.startswith("--"):
+                _, separator, sql = sql.partition("\n")
+                if not separator:
+                    return True
+            else:
+                _, separator, sql = sql.partition("*/")
+                if not separator:
+                    return False
+            sql = sql.lstrip()
+        verb = sql.split(None, 1)[0].upper() if sql else ""
+        return verb in {"SELECT", "EXPLAIN", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+
+    def _acquire_writer_lock(self) -> None:
+        """Acquire a portable advisory lock, with a bounded wait."""
+        if self._writer_lock_handle is not None:
+            return
+
+        lock_path = Path(f"{self._database_path}.writer.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        if os.name == "nt":
+            msvcrt = _get_msvcrt_locking()
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+        else:
+            import fcntl
+
+        deadline = time.monotonic() + _SQLITE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._writer_lock_handle = handle
+                return
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise sqlite3.OperationalError(
+                        f"Timed out waiting for the SQLite writer lock for {self._database_path}"
+                    ) from exc
+                time.sleep(0.05)
+
+    def _release_writer_lock(self) -> None:
+        handle = self._writer_lock_handle
+        if handle is None:
+            return
+        self._writer_lock_handle = None
+        try:
+            if os.name == "nt":
+                msvcrt = _get_msvcrt_locking()
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
+        if not self._is_read_only(sql):
+            self._acquire_writer_lock()
+        try:
+            return super().execute(sql, parameters)
+        except BaseException:
+            if not self.in_transaction:
+                self._release_writer_lock()
+            raise
+
+    def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
+        if not self._is_read_only(sql):
+            self._acquire_writer_lock()
+        try:
+            return super().executemany(sql, parameters)
+        except BaseException:
+            if not self.in_transaction:
+                self._release_writer_lock()
+            raise
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        self._acquire_writer_lock()
+        try:
+            return super().executescript(sql_script)
+        except BaseException:
+            if not self.in_transaction:
+                self._release_writer_lock()
+            raise
+
+    def commit(self) -> None:
+        try:
+            super().commit()
+        finally:
+            self._release_writer_lock()
+
+    def rollback(self) -> None:
+        try:
+            super().rollback()
+        finally:
+            self._release_writer_lock()
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._release_writer_lock()
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
-    """Get a thread-local cached SQLite connection with WAL mode enabled.
+    """Get a thread-local SQLite connection configured for concurrent workers.
 
-    Each thread gets its own connection (required for SQLite thread safety).
-    Connections are cached and reused within the same thread, keyed by resolved path.
-
-    Args:
-        db_path: Override the default active profile DB_PATH. Useful for testing.
-
-    Returns:
-        sqlite3.Connection configured with WAL mode and row factory.
+    Every new connection enables WAL, NORMAL synchronous mode, a 30-second
+    busy timeout, and a 64 MiB page cache. Write transactions use a portable
+    advisory lock in addition to SQLite's native locking.
     """
-    path = str(db_path or config.DB_PATH)
-
+    path = str(Path(db_path or config.DB_PATH).expanduser().resolve())
+    connections: dict[str, sqlite3.Connection] = getattr(_local, "connections", {})
     if not hasattr(_local, "connections"):
-        _local.connections = {}
+        _local.connections = connections
 
-    conn = _local.connections.get(path)
+    conn = connections.get(path)
     if conn is not None:
         try:
             conn.execute("SELECT 1")
             return conn
         except sqlite3.ProgrammingError:
-            _local.connections.pop(path, None)
+            connections.pop(path, None)
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(
+        path,
+        timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000,
+        factory=_SerializedSQLiteConnection,
+    )
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA cache_size=-64000")
     conn.row_factory = sqlite3.Row
-    _local.connections[path] = conn
+    connections[path] = conn
     return conn
 
 
 def close_connection(db_path: Path | str | None = None) -> None:
     """Close the cached connection for the current thread."""
-    path = str(db_path or config.DB_PATH)
-    if hasattr(_local, "connections"):
-        conn = _local.connections.pop(path, None)
-        if conn is not None:
-            conn.close()
+    path = str(Path(db_path or config.DB_PATH).expanduser().resolve())
+    connections: dict[str, sqlite3.Connection] = getattr(_local, "connections", {})
+    conn = connections.pop(path, None)
+    if conn is not None:
+        conn.close()
 
 
 def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -163,8 +319,22 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     """)
     conn.commit()
 
-    # Run migrations for any columns added after initial schema
+    # Run migrations for any columns added after initial schema.
     ensure_columns(conn)
+
+    # Column-name equivalents for this schema: URL is already indexed as the
+    # primary key, apply_status is the application status, fit_score is the
+    # score, and discovered_at is the creation timestamp.
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_jobs_fingerprint ON jobs(fingerprint)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_apply_status ON jobs(apply_status)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_fit_score_discovered ON jobs(fit_score DESC, discovered_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_pending_detail ON jobs(detail_scraped_at, site)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_crm_score_date ON jobs(crm_stage, fit_score DESC, discovered_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_sponsor_status ON jobs(sponsor_status)",
+    ):
+        conn.execute(index_sql)
+    conn.commit()
 
     return conn
 
@@ -257,7 +427,7 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     return added
 
 
-def get_stats(conn: sqlite3.Connection | None = None) -> dict:
+def get_stats(conn: sqlite3.Connection | None = None) -> DatabaseStats:
     """Return job counts by pipeline stage.
 
     Args:
@@ -269,7 +439,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     if conn is None:
         conn = get_connection()
 
-    stats: dict = {}
+    stats: DatabaseStats = {}
 
     # Total jobs
     stats["total"] = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
@@ -446,7 +616,7 @@ _DIRECT_ATS_STRATEGIES = {
 }
 
 
-def deduplicate_jobs(conn: sqlite3.Connection | None = None) -> dict:
+def deduplicate_jobs(conn: sqlite3.Connection | None = None) -> DatabaseStats:
     """Merge duplicate job rows sharing the same normalized `(company, title, location)` fingerprint.
 
     Prioritizes:
@@ -463,52 +633,63 @@ def deduplicate_jobs(conn: sqlite3.Connection | None = None) -> dict:
         conn = get_connection()
 
     ensure_columns(conn)
-    rows = conn.execute("SELECT * FROM jobs").fetchall()
-    if not rows:
+    count_row = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+    checked = int(count_row[0]) if count_row is not None else 0
+    if checked == 0:
         return {"checked": 0, "duplicates_removed": 0, "groups_merged": 0}
 
-    cols = rows[0].keys()
-    all_jobs = [dict(zip(cols, r)) for r in rows]
+    max_row = conn.execute("SELECT MAX(rowid) FROM jobs").fetchone()
+    max_rowid = int(max_row[0]) if max_row is not None and max_row[0] is not None else 0
 
-    # Backfill missing fingerprints first
-    groups: dict[str, list[dict]] = {}
-    for j in all_jobs:
-        fp = j.get("fingerprint")
-        if not fp:
-            fp = compute_job_fingerprint(j.get("company"), j.get("title"), j.get("location"))
-            conn.execute("UPDATE jobs SET fingerprint = ? WHERE url = ?", (fp, j["url"]))
-            j["fingerprint"] = fp
-        if fp.startswith("unknown::") or fp.endswith("::untitled::any"):
-            continue
-        groups.setdefault(fp, []).append(j)
+    # Backfill old records in bounded rowid windows rather than materializing
+    # every job just to compute missing fingerprints.
+    while True:
+        missing_rows = conn.execute(
+            "SELECT rowid AS _dedup_rowid, company, title, location "
+            "FROM jobs WHERE rowid <= ? AND (fingerprint IS NULL OR fingerprint = '') "
+            "ORDER BY rowid LIMIT 500",
+            (max_rowid,),
+        ).fetchall()
+        if not missing_rows:
+            break
 
-    duplicates_removed = 0
-    groups_merged = 0
+        fingerprint_updates: list[tuple[str, int]] = []
+        for row in missing_rows:
+            fingerprint = compute_job_fingerprint(row["company"], row["title"], row["location"])
+            fingerprint_updates.append((fingerprint, int(row["_dedup_rowid"])))
+        conn.executemany(
+            "UPDATE jobs SET fingerprint = ? WHERE rowid = ?",
+            fingerprint_updates,
+        )
 
-    def _rank_row(r: dict) -> tuple:
-        has_applied = 1 if r.get("applied_at") else 0
-        has_tailored = 1 if r.get("tailored_resume_path") else 0
-        has_scored = 1 if r.get("fit_score") is not None else 0
-        strat = (r.get("strategy") or "").lower()
-        url_l = (r.get("url") or "").lower()
-        is_direct_ats = 1 if (
-            strat in _DIRECT_ATS_STRATEGIES
-            or any(
-                d in url_l
-                for d in (
-                    "myworkdayjobs.com",
-                    "greenhouse.io",
-                    "lever.co",
-                    "ashbyhq.com",
-                    "smartrecruiters.com",
-                    "personio.",
-                    "workable.com",
-                    "recruitee.com",
-                )
-            )
-        ) else 0
-        desc_len = len(r.get("full_description") or r.get("description") or "")
-        return (has_applied, has_tailored, is_direct_ats, has_scored, desc_len)
+    direct_strategies = tuple(sorted(_DIRECT_ATS_STRATEGIES))
+    direct_domains = (
+        "myworkdayjobs.com",
+        "greenhouse.io",
+        "lever.co",
+        "ashbyhq.com",
+        "smartrecruiters.com",
+        "personio.",
+        "workable.com",
+        "recruitee.com",
+    )
+    strategy_placeholders = ", ".join("?" for _ in direct_strategies)
+    domain_conditions = " OR ".join(
+        "LOWER(COALESCE(url, '')) LIKE ?" for _ in direct_domains
+    )
+    group_order = f"""
+        ORDER BY
+            CASE WHEN NULLIF(applied_at, '') IS NOT NULL THEN 1 ELSE 0 END DESC,
+            CASE WHEN NULLIF(tailored_resume_path, '') IS NOT NULL THEN 1 ELSE 0 END DESC,
+            CASE WHEN LOWER(COALESCE(strategy, '')) IN ({strategy_placeholders})
+                 OR {domain_conditions} THEN 1 ELSE 0 END DESC,
+            CASE WHEN fit_score IS NOT NULL THEN 1 ELSE 0 END DESC,
+            LENGTH(COALESCE(NULLIF(full_description, ''), NULLIF(description, ''), '')) DESC,
+            rowid ASC
+    """
+    group_params: tuple[str, ...] = direct_strategies + tuple(
+        f"%{domain}%" for domain in direct_domains
+    )
 
     merge_fields = (
         "salary", "description", "full_description", "application_url",
@@ -519,45 +700,89 @@ def deduplicate_jobs(conn: sqlite3.Connection | None = None) -> dict:
         "work_arrangement", "ats_coverage_pct", "prep_pack_path", "outreach_path",
     )
 
-    for fp, items in groups.items():
-        if len(items) < 2:
-            continue
+    duplicates_removed = 0
+    groups_merged = 0
+    max_fingerprint_row = conn.execute(
+        "SELECT MAX(fingerprint) FROM jobs WHERE fingerprint IS NOT NULL AND fingerprint != ''"
+    ).fetchone()
+    max_fingerprint = (
+        str(max_fingerprint_row[0])
+        if max_fingerprint_row is not None and max_fingerprint_row[0] is not None
+        else ""
+    )
+    last_fingerprint = ""
+    while True:
+        fingerprint_rows = conn.execute(
+            "SELECT fingerprint FROM jobs "
+            "WHERE rowid <= ? AND fingerprint IS NOT NULL AND fingerprint != '' "
+            "AND fingerprint > ? AND fingerprint <= ? "
+            "GROUP BY fingerprint HAVING COUNT(*) > 1 "
+            "ORDER BY fingerprint LIMIT 500",
+            (max_rowid, last_fingerprint, max_fingerprint),
+        ).fetchall()
+        if not fingerprint_rows:
+            break
 
-        ranked = sorted(items, key=_rank_row, reverse=True)
-        winner = ranked[0]
-        losers = ranked[1:]
+        for fingerprint_row in fingerprint_rows:
+            fingerprint = str(fingerprint_row[0])
+            last_fingerprint = fingerprint
+            if fingerprint.startswith("unknown::") or fingerprint.endswith("::untitled::any"):
+                continue
 
-        updates: dict[str, object] = {}
-        for field in merge_fields:
-            if winner.get(field) in (None, ""):
-                for loser in losers:
-                    if loser.get(field) not in (None, ""):
+            group_rows = conn.execute(
+                f"SELECT * FROM jobs WHERE fingerprint = ? AND rowid <= ? {group_order}",
+                (fingerprint, max_rowid, *group_params),
+            )
+            winner_row = group_rows.fetchone()
+            if winner_row is None:
+                continue
+            winner = dict(winner_row)
+            winner_url = winner["url"]
+            losers: list[str] = []
+            updates: dict[str, object] = {}
+
+            # The SQL order matches the former in-memory rank. Retaining only
+            # the winner and loser URLs bounds Python memory by the largest
+            # duplicate group, not by the total jobs table.
+            for loser_row in group_rows:
+                loser = dict(loser_row)
+                losers.append(str(loser["url"]))
+                for field in merge_fields:
+                    if winner.get(field) in (None, "") and loser.get(field) not in (None, ""):
                         updates[field] = loser[field]
                         winner[field] = loser[field]
-                        break
 
-        # Also prefer longer full_description if a loser has a substantially richer description
-        winner_desc = winner.get("full_description") or ""
-        for loser in losers:
-            loser_desc = loser.get("full_description") or ""
-            if len(loser_desc) > len(winner_desc) + 200:
-                updates["full_description"] = loser_desc
-                winner_desc = loser_desc
+            winner_desc = winner.get("full_description") or ""
+            for description_row in conn.execute(
+                "SELECT url, full_description FROM jobs "
+                f"WHERE fingerprint = ? AND rowid <= ? {group_order}",
+                (fingerprint, max_rowid, *group_params),
+            ):
+                if description_row["url"] == winner_url:
+                    continue
+                loser_desc = description_row["full_description"] or ""
+                if len(loser_desc) > len(winner_desc) + 200:
+                    updates["full_description"] = loser_desc
+                    winner_desc = loser_desc
 
-        if updates:
-            set_clause = ", ".join(f"{k} = ?" for k in updates)
-            params = list(updates.values()) + [winner["url"]]
-            conn.execute(f"UPDATE jobs SET {set_clause} WHERE url = ?", params)
+            if updates:
+                set_clause = ", ".join(f"{field} = ?" for field in updates)
+                conn.execute(
+                    f"UPDATE jobs SET {set_clause} WHERE url = ?",
+                    (*updates.values(), winner_url),
+                )
 
-        for loser in losers:
-            conn.execute("DELETE FROM jobs WHERE url = ?", (loser["url"],))
-            duplicates_removed += 1
-
-        groups_merged += 1
+            if losers:
+                conn.executemany(
+                    "DELETE FROM jobs WHERE url = ?",
+                    ((loser_url,) for loser_url in losers),
+                )
+                duplicates_removed += len(losers)
+                groups_merged += 1
 
     conn.commit()
     return {
-        "checked": len(all_jobs),
+        "checked": checked,
         "duplicates_removed": duplicates_removed,
         "groups_merged": groups_merged,
     }
@@ -565,7 +790,7 @@ def deduplicate_jobs(conn: sqlite3.Connection | None = None) -> dict:
 
 def store_jobs(
     conn: sqlite3.Connection,
-    jobs: list[dict],
+    jobs: list[JobRecord],
     site: str,
     strategy: str,
 ) -> tuple[int, int]:
@@ -644,7 +869,7 @@ def get_jobs_by_stage(
     stage: str = "discovered",
     min_score: int | None = None,
     limit: int = 100,
-) -> list[dict]:
+) -> list[JobRecord]:
     """Fetch jobs filtered by pipeline stage.
 
     Args:
@@ -678,7 +903,7 @@ def get_jobs_by_stage(
     }
 
     where = conditions.get(stage, "1=1")
-    params: list = []
+    params: list[Any] = []
 
     if "?" in where and min_score is not None:
         params.append(min_score)

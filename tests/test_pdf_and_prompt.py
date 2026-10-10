@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from applypilot import config
 from applypilot.apply.prompt import build_prompt
 from applypilot.scoring.pdf import (
@@ -71,7 +73,7 @@ def test_cover_letter_detection_and_dedicated_html_template(tmp_path: Path) -> N
     assert "class=\"letter-body\"" in html
 
 
-def test_build_prompt_uk_eu_eligibility_and_worker_isolation(tmp_path: Path, monkeypatch) -> None:
+def test_build_prompt_uk_eu_eligibility_and_worker_isolation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """build_prompt allows UK/EU locations, isolates worker uploads, and redacts secrets when requested."""
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
 

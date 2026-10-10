@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from typing import Any
 from pathlib import Path
 
 from rich.console import Console
@@ -75,11 +76,11 @@ def _setup_resume() -> None:
 # Profile
 # ---------------------------------------------------------------------------
 
-def _setup_profile() -> dict:
+def _setup_profile() -> dict[str, Any]:
     """Walk through profile questions and return a nested profile dict."""
     console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
 
-    profile: dict = {}
+    profile: dict[str, Any] = {}
 
     domain = Prompt.ask(
         "Professional domain",

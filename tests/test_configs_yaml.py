@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from applypilot import config
+import applypilot.config as config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -16,15 +16,13 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.database import close_connection, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -291,6 +289,13 @@ APPLY_SELECTORS = [
     'a[class*="btn-apply"]',
     'a[class*="apply-btn"]',
     'a[class*="apply-button"]',
+    # European & UK ATS platforms (Personio, Teamtailor, Pinpoint, SmartRecruiters, Workable, Recruitee)
+    'a.career-btn-apply',
+    '[data-controller="career--apply-button"] a',
+    'a[href*="/applications/new"]',
+    'a#st-apply',
+    'a[data-ui="overview-apply-now"]',
+    'a[href*="/c/new"]',
 ]
 
 DESCRIPTION_SELECTORS = [
@@ -317,6 +322,12 @@ DESCRIPTION_SELECTORS = [
     'main article',
     'article[class*="job"]',
     '.job-posting-content',
+    # European & UK ATS platforms (Personio, Teamtailor, Pinpoint, SmartRecruiters, Workable)
+    '.job-detail-description',
+    '.body-text',
+    '[itemprop="description"]',
+    '[data-ui="job-description"]',
+    '.rt-text',
 ]
 
 
@@ -629,7 +640,7 @@ def scrape_site_batch(
     if own_conn:
         conn = init_db()
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
 
     try:
         with sync_playwright() as p:
@@ -683,7 +694,7 @@ def scrape_site_batch(
             browser.close()
     finally:
         if own_conn:
-            conn.close()
+            close_connection()
 
     return stats
 
@@ -849,7 +860,7 @@ def stream_detail(
         elapsed = time.time() - t0
         if total_ok or total_err:
             log.info("DONE: %d ok, %d errors in %.1fs", total_ok, total_err, elapsed)
-        conn.close()
+        close_connection()
         my_done.set()
 
 

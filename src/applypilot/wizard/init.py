@@ -1,10 +1,11 @@
 """ApplyPilot first-time setup wizard.
 
-Interactive flow that creates ~/.applypilot/ with:
+Interactive flow that creates the active profile workspace (`~/.applypilot/` or
+`~/.applypilot/profiles/<slug>/`) with:
   - resume.txt (and optionally resume.pdf)
-  - profile.json
+  - profile.json (restricted 0600 permissions)
   - searches.yaml
-  - .env (LLM API key)
+  - .env (LLM API key, restricted 0600 permissions)
 """
 
 from __future__ import annotations
@@ -13,20 +14,11 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
-from applypilot.config import (
-    APP_DIR,
-    ENV_PATH,
-    PROFILE_PATH,
-    RESUME_PATH,
-    RESUME_PDF_PATH,
-    SEARCH_CONFIG_PATH,
-    ensure_dirs,
-)
+from applypilot import config
 
 console = Console()
 
@@ -53,11 +45,11 @@ def _setup_resume() -> None:
             continue
 
         if suffix == ".txt":
-            shutil.copy2(src, RESUME_PATH)
-            console.print(f"[green]Copied to {RESUME_PATH}[/green]")
+            shutil.copy2(src, config.RESUME_PATH)
+            console.print(f"[green]Copied to {config.RESUME_PATH}[/green]")
         elif suffix == ".pdf":
-            shutil.copy2(src, RESUME_PDF_PATH)
-            console.print(f"[green]Copied to {RESUME_PDF_PATH}[/green]")
+            shutil.copy2(src, config.RESUME_PDF_PATH)
+            console.print(f"[green]Copied to {config.RESUME_PDF_PATH}[/green]")
 
             # Also ask for a plain-text version for LLM consumption
             txt_path_str = Prompt.ask(
@@ -67,8 +59,8 @@ def _setup_resume() -> None:
             if txt_path_str.strip():
                 txt_src = Path(txt_path_str.strip().strip('"').strip("'")).expanduser().resolve()
                 if txt_src.exists():
-                    shutil.copy2(txt_src, RESUME_PATH)
-                    console.print(f"[green]Copied to {RESUME_PATH}[/green]")
+                    shutil.copy2(txt_src, config.RESUME_PATH)
+                    console.print(f"[green]Copied to {config.RESUME_PATH}[/green]")
                 else:
                     console.print("[yellow]File not found, skipping plain-text copy.[/yellow]")
         break
@@ -84,6 +76,13 @@ def _setup_profile() -> dict:
 
     profile: dict = {}
 
+    domain = Prompt.ask(
+        "Professional domain",
+        choices=["software_engineering", "fpa_tech_hybrid", "finance_accounting"],
+        default="software_engineering",
+    )
+    profile["domain"] = domain
+
     # -- Personal --
     console.print("\n[bold cyan]Personal Information[/bold cyan]")
     full_name = Prompt.ask("Full name")
@@ -93,8 +92,8 @@ def _setup_profile() -> dict:
         "email": Prompt.ask("Email address"),
         "phone": Prompt.ask("Phone number", default=""),
         "city": Prompt.ask("City"),
-        "province_state": Prompt.ask("Province/State (e.g. Ontario, California)", default=""),
-        "country": Prompt.ask("Country"),
+        "province_state": Prompt.ask("Province/State/County (e.g. Greater London, North Holland)", default=""),
+        "country": Prompt.ask("Country", default="United Kingdom"),
         "postal_code": Prompt.ask("Postal/ZIP code", default=""),
         "address": Prompt.ask("Street address (optional, used for form auto-fill)", default=""),
         "linkedin_url": Prompt.ask("LinkedIn URL", default=""),
@@ -105,18 +104,19 @@ def _setup_profile() -> dict:
     }
 
     # -- Work Authorization --
-    console.print("\n[bold cyan]Work Authorization[/bold cyan]")
+    console.print("\n[bold cyan]Work Authorization & Relocation[/bold cyan]")
     profile["work_authorization"] = {
-        "legally_authorized_to_work": Confirm.ask("Are you legally authorized to work in your target country?"),
-        "require_sponsorship": Confirm.ask("Will you now or in the future need sponsorship?"),
-        "work_permit_type": Prompt.ask("Work permit type (e.g. Citizen, PR, Open Work Permit — leave blank if N/A)", default=""),
+        "legally_authorized_to_work": "Yes" if Confirm.ask("Are you legally authorized to work in your current country?", default=True) else "No",
+        "require_sponsorship": "Yes" if Confirm.ask("Will you need UK/EU visa sponsorship for onsite/hybrid roles?", default=True) else "No",
+        "willing_to_relocate": "Yes" if Confirm.ask("Are you willing to relocate to UK / EU hubs?", default=True) else "No",
+        "work_permit_type": Prompt.ask("Work permit / visa route (e.g. UK Skilled Worker / EU Blue Card / Citizen)", default="UK Skilled Worker / EU Blue Card / Remote"),
     }
 
     # -- Compensation --
     console.print("\n[bold cyan]Compensation[/bold cyan]")
-    salary = Prompt.ask("Expected annual salary (number)", default="")
-    salary_currency = Prompt.ask("Currency", default="USD")
-    salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
+    salary = Prompt.ask("Expected annual salary (number)", default="65000")
+    salary_currency = Prompt.ask("Primary currency (GBP, EUR, CHF, USD)", default="GBP")
+    salary_range = Prompt.ask("Acceptable range (e.g. 55000-85000)", default="55000-85000")
     range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
     profile["compensation"] = {
         "salary_expectation": salary,
@@ -126,37 +126,52 @@ def _setup_profile() -> dict:
     }
 
     # -- Experience --
-    console.print("\n[bold cyan]Experience[/bold cyan]")
+    console.print("\n[bold cyan]Experience & Qualifications[/bold cyan]")
     current_title = Prompt.ask("Current/most recent job title", default="")
-    target_role = Prompt.ask("Target role (what you're applying for, e.g. 'Senior Backend Engineer')", default=current_title)
+    target_role = Prompt.ask("Target role (e.g. 'Senior AI Engineer' or 'Chartered Accountant (ACA)')", default=current_title)
     profile["experience"] = {
         "years_of_experience_total": Prompt.ask("Years of professional experience", default=""),
-        "education_level": Prompt.ask("Highest education (e.g. Bachelor's, Master's, PhD, Self-taught)", default=""),
+        "education_level": Prompt.ask("Highest education / qualification (e.g. ACA Chartered Accountant, Master's, Bachelor's)", default=""),
+        "current_job_title": current_title,
         "current_title": current_title,
         "target_role": target_role,
     }
 
     # -- Skills Boundary --
-    console.print("\n[bold cyan]Skills[/bold cyan] (comma-separated)")
-    langs = Prompt.ask("Programming languages", default="")
-    frameworks = Prompt.ask("Frameworks & libraries", default="")
-    tools = Prompt.ask("Tools & platforms (e.g. Docker, AWS, Git)", default="")
-    profile["skills_boundary"] = {
-        "programming_languages": [s.strip() for s in langs.split(",") if s.strip()],
-        "frameworks": [s.strip() for s in frameworks.split(",") if s.strip()],
-        "tools": [s.strip() for s in tools.split(",") if s.strip()],
-    }
+    console.print("\n[bold cyan]Skills & Core Competencies[/bold cyan] (comma-separated)")
+    if domain == "finance_accounting":
+        stds = Prompt.ask("Accounting & Reporting Standards (e.g. IFRS, UK GAAP, FRS 102)", default="IFRS, UK GAAP, FRS 102, IAS")
+        audit = Prompt.ask("Audit & Internal Controls (e.g. ISA, External Audit, SOX)", default="External Audit, ISA, Internal Controls, SOX")
+        fpa = Prompt.ask("FP&A & Commercial Finance (e.g. Budgeting, Forecasting, Financial Modelling)", default="FP&A, Budgeting, Forecasting, Variance Analysis, Financial Modelling")
+        erp = Prompt.ask("Systems & ERP Tools (e.g. SAP, NetSuite, Excel, Power BI)", default="Advanced Excel, Power BI, SAP, NetSuite, Xero")
+        profile["skills_boundary"] = {
+            "Accounting & Reporting Standards": [s.strip() for s in stds.split(",") if s.strip()],
+            "Audit, Assurance & Internal Controls": [s.strip() for s in audit.split(",") if s.strip()],
+            "FP&A & Commercial Finance": [s.strip() for s in fpa.split(",") if s.strip()],
+            "Systems, ERP & Data Tools": [s.strip() for s in erp.split(",") if s.strip()],
+        }
+    else:
+        langs = Prompt.ask("Programming languages", default="")
+        frameworks = Prompt.ask("Frameworks & libraries", default="")
+        tools = Prompt.ask("Tools & platforms (e.g. Docker, AWS, Git, SAP, Power BI)", default="")
+        profile["skills_boundary"] = {
+            "programming_languages": [s.strip() for s in langs.split(",") if s.strip()],
+            "frameworks": [s.strip() for s in frameworks.split(",") if s.strip()],
+            "tools": [s.strip() for s in tools.split(",") if s.strip()],
+        }
 
     # -- Resume Facts (preserved truths for tailoring) --
     console.print("\n[bold cyan]Resume Facts[/bold cyan]")
     console.print("[dim]These are preserved exactly during resume tailoring — the AI will never change them.[/dim]")
     companies = Prompt.ask("Companies to always keep (comma-separated)", default="")
-    projects = Prompt.ask("Projects to always keep (comma-separated)", default="")
-    school = Prompt.ask("School name(s) to preserve", default="")
-    metrics = Prompt.ask("Real metrics to preserve (e.g. '99.9% uptime, 50k users')", default="")
+    projects = Prompt.ask("Projects to always keep (comma-separated, leave blank if N/A)", default="")
+    certs = Prompt.ask("Professional certifications to keep (e.g. ACA, ICAEW, ACCA, AWS)", default="")
+    school = Prompt.ask("School / institute name(s) to preserve", default="")
+    metrics = Prompt.ask("Real metrics to preserve (e.g. '99.9% uptime, £50M audit scope')", default="")
     profile["resume_facts"] = {
         "preserved_companies": [s.strip() for s in companies.split(",") if s.strip()],
         "preserved_projects": [s.strip() for s in projects.split(",") if s.strip()],
+        "certifications": [s.strip() for s in certs.split(",") if s.strip()],
         "preserved_school": school.strip(),
         "real_metrics": [s.strip() for s in metrics.split(",") if s.strip()],
     }
@@ -170,13 +185,18 @@ def _setup_profile() -> dict:
     }
 
     # -- Availability --
+    earliest = Prompt.ask("Earliest start date / notice period", default="Immediately")
     profile["availability"] = {
-        "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
+        "earliest_start_date": earliest,
+        "notice_period": earliest,
     }
 
-    # Save
-    PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
-    console.print(f"\n[green]Profile saved to {PROFILE_PATH}[/green]")
+    # Save with restricted permissions
+    config.secure_write_text(
+        config.PROFILE_PATH,
+        json.dumps(profile, indent=2, ensure_ascii=False),
+    )
+    console.print(f"\n[green]Profile saved to {config.PROFILE_PATH}[/green]")
     return profile
 
 
@@ -186,17 +206,17 @@ def _setup_profile() -> dict:
 
 def _setup_searches() -> None:
     """Generate a searches.yaml from user input."""
-    console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for."))
+    console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for across UK & EU."))
 
-    location = Prompt.ask("Target location (e.g. 'Remote', 'Canada', 'New York, NY')", default="Remote")
-    distance_str = Prompt.ask("Search radius in miles (0 for remote-only)", default="0")
+    location = Prompt.ask("Primary target location (e.g. 'London, United Kingdom', 'Amsterdam, Netherlands', 'Remote')", default="London, United Kingdom")
+    distance_str = Prompt.ask("Search radius in miles (0 for remote-only)", default="25")
     try:
         distance = int(distance_str)
     except ValueError:
-        distance = 0
+        distance = 25
 
     roles_raw = Prompt.ask(
-        "Target job titles (comma-separated, e.g. 'Backend Engineer, Full Stack Developer')"
+        "Target job titles (comma-separated, e.g. 'AI Engineer, Chartered Accountant ACA')"
     )
     roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
 
@@ -204,7 +224,6 @@ def _setup_searches() -> None:
         console.print("[yellow]No roles provided. Using a default set.[/yellow]")
         roles = ["Software Engineer"]
 
-    # Build YAML content
     lines = [
         "# ApplyPilot search configuration",
         "# Edit this file to refine your job search queries.",
@@ -225,8 +244,8 @@ def _setup_searches() -> None:
         lines.append(f'  - query: "{role}"')
         lines.append(f"    tier: {min(i + 1, 3)}")
 
-    SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    console.print(f"[green]Search config saved to {SEARCH_CONFIG_PATH}[/green]")
+    config.SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    console.print(f"[green]Search config saved to {config.SEARCH_CONFIG_PATH}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -255,12 +274,12 @@ def _setup_ai_features() -> None:
     env_lines = ["# ApplyPilot configuration", ""]
 
     if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
+        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)", password=True)
         model = Prompt.ask("Model", default="gemini-2.0-flash")
         env_lines.append(f"GEMINI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
+        api_key = Prompt.ask("OpenAI API key", password=True)
         model = Prompt.ask("Model", default="gpt-4o-mini")
         env_lines.append(f"OPENAI_API_KEY={api_key}")
         env_lines.append(f"LLM_MODEL={model}")
@@ -271,8 +290,8 @@ def _setup_ai_features() -> None:
         env_lines.append(f"LLM_MODEL={model}")
 
     env_lines.append("")
-    ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
+    config.secure_write_text(config.ENV_PATH, "\n".join(env_lines))
+    console.print(f"[green]AI configuration saved to {config.ENV_PATH}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +310,6 @@ def _setup_auto_apply() -> None:
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
     if shutil.which("claude"):
         console.print("[green]Claude Code CLI detected.[/green]")
     else:
@@ -301,20 +319,21 @@ def _setup_auto_apply() -> None:
             "Auto-apply won't work until Claude Code is installed."
         )
 
-    # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
     if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
-        # Append to existing .env or create
-        if ENV_PATH.exists():
-            existing = ENV_PATH.read_text(encoding="utf-8")
+        capsolver_key = Prompt.ask("CapSolver API key", password=True)
+        if config.ENV_PATH.exists():
+            existing = config.ENV_PATH.read_text(encoding="utf-8")
             if "CAPSOLVER_API_KEY" not in existing:
-                ENV_PATH.write_text(
+                config.secure_write_text(
+                    config.ENV_PATH,
                     existing.rstrip() + f"\nCAPSOLVER_API_KEY={capsolver_key}\n",
-                    encoding="utf-8",
                 )
         else:
-            ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
+            config.secure_write_text(
+                config.ENV_PATH,
+                f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n",
+            )
         console.print("[green]CapSolver key saved.[/green]")
     else:
         console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")
@@ -326,19 +345,22 @@ def _setup_auto_apply() -> None:
 
 def run_wizard() -> None:
     """Run the full interactive setup wizard."""
+    active_prof = config.get_active_profile()
+    prof_label = f" (profile: [bold]{active_prof}[/bold])" if active_prof else ""
+
     console.print()
     console.print(
         Panel.fit(
-            "[bold green]ApplyPilot Setup Wizard[/bold green]\n\n"
+            f"[bold green]ApplyPilot Setup Wizard{prof_label}[/bold green]\n\n"
             "This will create your configuration at:\n"
-            f"  [cyan]{APP_DIR}[/cyan]\n\n"
+            f"  [cyan]{config.APP_DIR}[/cyan]\n\n"
             "You can re-run this anytime with [bold]applypilot init[/bold].",
             border_style="green",
         )
     )
 
-    ensure_dirs()
-    console.print(f"[dim]Created {APP_DIR}[/dim]\n")
+    config.ensure_dirs()
+    console.print(f"[dim]Created {config.APP_DIR}[/dim]\n")
 
     # Step 1: Resume
     _setup_resume()
@@ -361,14 +383,12 @@ def run_wizard() -> None:
     console.print()
 
     # Done — show tier status
-    from applypilot.config import get_tier, TIER_LABELS, TIER_COMMANDS
-
-    tier = get_tier()
+    tier = config.get_tier()
 
     tier_lines: list[str] = []
     for t in range(1, 4):
-        label = TIER_LABELS[t]
-        cmds = ", ".join(f"[bold]{c}[/bold]" for c in TIER_COMMANDS[t])
+        label = config.TIER_LABELS[t]
+        cmds = ", ".join(f"[bold]{c}[/bold]" for c in config.TIER_COMMANDS[t])
         if t <= tier:
             tier_lines.append(f"  [green]✓ Tier {t} — {label}[/green]  ({cmds})")
         elif t == tier + 1:
@@ -385,7 +405,7 @@ def run_wizard() -> None:
     console.print(
         Panel.fit(
             "[bold green]Setup complete![/bold green]\n\n"
-            f"[bold]Your tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]\n\n"
+            f"[bold]Your tier: Tier {tier} — {config.TIER_LABELS[tier]}[/bold]\n\n"
             + "\n".join(tier_lines)
             + unlock_hint,
             border_style="green",

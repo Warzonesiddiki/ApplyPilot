@@ -303,3 +303,188 @@ employers:
     tenant: "canadiansolar"
     site_id: "CanadianSolar"
     base_url: "https://canadiansolar.wd5.myworkdayjobs.com"
+
+  # ── UK & European Banking, Insurance, FinTech & Financial Services ──────
+
+  barclays:
+    name: "Barclays"
+    tenant: "barclays"
+    site_id: "External_Career_Site_Barclays"
+    base_url: "https://barclays.wd3.myworkdayjobs.com"
+
+  natwest:
+    name: "NatWest Group"
+    tenant: "natwest"
+    site_id: "natwestcareers"
+    base_url: "https://natwest.wd3.myworkdayjobs.com"
+
+  lloyds:
+    name: "Lloyds Banking Group"
+    tenant: "lbg"
+    site_id: "LBG_Careers"
+    base_url: "https://lbg.wd3.myworkdayjobs.com"
+
+  standard_chartered:
+    name: "Standard Chartered"
+    tenant: "scb"
+    site_id: "StandardCharteredCareers"
+    base_url: "https://scb.wd3.myworkdayjobs.com"
+
+  santander:
+    name: "Santander"
+    tenant: "santander"
+    site_id: "SantanderCareers"
+    base_url: "https://santander.wd3.myworkdayjobs.com"
+
+  deutsche_bank:
+    name: "Deutsche Bank"
+    tenant: "db"
+    site_id: "DBWebsite"
+    base_url: "https://db.wd3.myworkdayjobs.com"
+
+  ubs:
+    name: "UBS"
+    tenant: "ubs"
+    site_id: "UBSCareers"
+    base_url: "https://ubs.wd3.myworkdayjobs.com"
+
+  lseg:
+    name: "London Stock Exchange Group (LSEG)"
+    tenant: "lseg"
+    site_id: "Careers"
+    base_url: "https://lseg.wd3.myworkdayjobs.com"
+
+  zurich:
+    name: "Zurich Insurance"
+    tenant: "zurich"
+    site_id: "Zurich_External_Career_Site"
+    base_url: "https://zurich.wd3.myworkdayjobs.com"
+
+  axa:
+    name: "AXA"
+    tenant: "axa"
+    site_id: "AXA_External"
+    base_url: "https://axa.wd3.myworkdayjobs.com"
+
+  ing:
+    name: "ING"
+    tenant: "ing"
+    site_id: "ICS"
+    base_url: "https://ing.wd3.myworkdayjobs.com"
+
+  abn_amro:
+    name: "ABN AMRO"
+    tenant: "abnamro"
+    site_id: "abnamro"
+    base_url: "https://abnamro.wd3.myworkdayjobs.com"
+
+  # ── UK & European Tech, Pharma, Engineering & Multinationals ────────────
+
+  astrazeneca:
+    name: "AstraZeneca"
+    tenant: "astrazeneca"
+    site_id: "Careers"
+    base_url: "https://astrazeneca.wd3.myworkdayjobs.com"
+
+  gsk:
+    name: "GSK"
+    tenant: "gsk"
+    site_id: "GSKCareers"
+    base_url: "https://gsk.wd5.myworkdayjobs.com"
+
+  unilever:
+    name: "Unilever"
+    tenant: "unilever"
+    site_id: "Unilever_Experienced_Professionals"
+    base_url: "https://unilever.wd3.myworkdayjobs.com"
+
+  haleon:
+    name: "Haleon"
+    tenant: "haleon"
+    site_id: "Haleon_Careers"
+    base_url: "https://haleon.wd3.myworkdayjobs.com"
+
+  relx:
+    name: "RELX"
+    tenant: "relx"
+    site_id: "relx"
+    base_url: "https://relx.wd3.myworkdayjobs.com"
+
+  diageo:
+    name: "Diageo"
+    tenant: "diageo"
+    site_id: "Diageo_Careers"
+    base_url: "https://diageo.wd3.myworkdayjobs.com"
+
+  dyson:
+    name: "Dyson"
+    tenant: "dyson"
+    site_id: "Dyson_Careers"
+    base_url: "https://dyson.wd3.myworkdayjobs.com"
+
+  arm:
+    name: "Arm"
+    tenant: "arm"
+    site_id: "arm"
+    base_url: "https://arm.wd3.myworkdayjobs.com"
+
+  rolls_royce:
+    name: "Rolls-Royce"
+    tenant: "rollsroyce"
+    site_id: "professional"
+    base_url: "https://rollsroyce.wd3.myworkdayjobs.com"
+
+  airbus:
+    name: "Airbus"
+    tenant: "ag"
+    site_id: "Airbus"
+    base_url: "https://ag.wd3.myworkdayjobs.com"
+
+  siemens:
+    name: "Siemens"
+    tenant: "siemens"
+    site_id: "Jobs"
+    base_url: "https://siemens.wd3.myworkdayjobs.com"
+
+  asml:
+    name: "ASML"
+    tenant: "asml"
+    site_id: "asml"
+    base_url: "https://asml.wd3.myworkdayjobs.com"
+
+  philips:
+    name: "Philips"
+    tenant: "philips"
+    site_id: "jobs-and-careers"
+    base_url: "https://philips.wd3.myworkdayjobs.com"
+
+  sanofi:
+    name: "Sanofi"
+    tenant: "sanofi"
+    site_id: "SanofiCareers"
+    base_url: "https://sanofi.wd3.myworkdayjobs.com"
+
+  roche:
+    name: "Roche"
+    tenant: "roche"
+    site_id: "roche-ext"
+    base_url: "https://roche.wd3.myworkdayjobs.com"
+
+  maersk:
+    name: "Maersk"
+    tenant: "maersk"
+    site_id: "Maersk_Careers"
+    base_url: "https://maersk.wd3.myworkdayjobs.com"
+
+  grant_thornton:
+    name: "Grant Thornton"
+    tenant: "gt"
+    site_id: "GrantThornton"
+    base_url: "https://gt.wd1.myworkdayjobs.com"
+
+  rsm:
+    name: "RSM"
+    tenant: "rsm"
+    site_id: "RSMCareers"
+    base_url: "https://rsm.wd1.myworkdayjobs.com"
+

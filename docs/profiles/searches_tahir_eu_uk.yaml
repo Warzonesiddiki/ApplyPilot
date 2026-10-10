@@ -1,0 +1,165 @@
+# ApplyPilot EU & UK Search Configuration — Tahir Siddique
+# Senior Accountant | ACCA Finalist (11/13 Passed, SBR & ATX-UK) | IFRS | UK Tax | ERP Implementation
+
+defaults:
+  distance: 25
+  hours_old: 72
+  results_per_site: 50
+
+locations:
+  # Tier 1: United Kingdom & Ireland (Primary Relocation Target)
+  - location: "London, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "Manchester, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "Birmingham, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "Edinburgh, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "Bristol, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "Leeds, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - location: "United Kingdom"
+    country_indeed: "uk"
+    remote: true
+  - location: "Dublin, Ireland"
+    country_indeed: "ireland"
+    remote: false
+  - location: "Cork, Ireland"
+    country_indeed: "ireland"
+    remote: false
+  - location: "Ireland"
+    country_indeed: "ireland"
+    remote: true
+
+  # Tier 2: Benelux, DACH & Major EU Financial/Corporate Hubs
+  - location: "Amsterdam, Netherlands"
+    country_indeed: "netherlands"
+    remote: false
+  - location: "Rotterdam, Netherlands"
+    country_indeed: "netherlands"
+    remote: false
+  - location: "Luxembourg"
+    country_indeed: "luxembourg"
+    remote: false
+  - location: "Frankfurt, Germany"
+    country_indeed: "germany"
+    remote: false
+  - location: "Berlin, Germany"
+    country_indeed: "germany"
+    remote: false
+  - location: "Munich, Germany"
+    country_indeed: "germany"
+    remote: false
+  - location: "Zurich, Switzerland"
+    country_indeed: "switzerland"
+    remote: false
+  - location: "Brussels, Belgium"
+    country_indeed: "belgium"
+    remote: false
+  - location: "Paris, France"
+    country_indeed: "france"
+    remote: false
+  - location: "Madrid, Spain"
+    country_indeed: "spain"
+    remote: false
+  - location: "Warsaw, Poland"
+    country_indeed: "poland"
+    remote: false
+
+queries:
+  # Tier 1: Core Senior & Financial Accounting Roles (UK, Ireland & EU)
+  - query: "Senior Accountant"
+    tier: 1
+  - query: "Financial Accountant"
+    tier: 1
+  - query: "Management Accountant"
+    tier: 1
+  - query: "ACCA Finalist Accountant"
+    tier: 1
+  - query: "Part Qualified Accountant ACCA"
+    tier: 1
+  - query: "IFRS Financial Accountant"
+    tier: 1
+
+  # Tier 2: ERP Implementation, Finance Systems & Multi-Entity Reporting
+  - query: "ERP Implementation Consultant Finance"
+    tier: 2
+  - query: "Finance Systems Analyst"
+    tier: 2
+  - query: "Group Financial Accountant"
+    tier: 2
+  - query: "Statutory Reporting Accountant"
+    tier: 2
+  - query: "Client Accountant Practice"
+    tier: 2
+
+  # Tier 3: UK/EU Tax, VAT & Commercial Finance
+  - query: "VAT and Corporate Tax Accountant"
+    tier: 3
+  - query: "Tax and Statutory Accountant"
+    tier: 3
+  - query: "Assistant Financial Controller"
+    tier: 3
+  - query: "General Ledger Senior Accountant"
+    tier: 3
+
+exclude_titles:
+  - "Intern"
+  - "Apprentice"
+  - "Trainee"
+  - "Purchase Ledger Clerk"
+  - "Accounts Payable Clerk"
+  - "Chief Financial Officer"
+
+filters:
+  location_accept:
+    - "remote"
+    - "united kingdom"
+    - "uk"
+    - "england"
+    - "scotland"
+    - "london"
+    - "manchester"
+    - "birmingham"
+    - "edinburgh"
+    - "bristol"
+    - "leeds"
+    - "ireland"
+    - "dublin"
+    - "cork"
+    - "galway"
+    - "netherlands"
+    - "amsterdam"
+    - "rotterdam"
+    - "luxembourg"
+    - "germany"
+    - "frankfurt"
+    - "berlin"
+    - "munich"
+    - "switzerland"
+    - "zurich"
+    - "geneva"
+    - "belgium"
+    - "brussels"
+    - "france"
+    - "paris"
+    - "spain"
+    - "madrid"
+    - "barcelona"
+    - "poland"
+    - "warsaw"
+    - "europe"
+    - "emea"
+  location_reject:
+    - "security clearance required"
+    - "dv cleared"
+    - "sc cleared"
+    - "us citizens only"

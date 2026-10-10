@@ -1,0 +1,259 @@
+# ApplyPilot Search Configuration — Neha Tariq, ACA (UK & Pan-EU)
+# Target Track: ACA Chartered Accountant — Audit, Financial Reporting (IFRS / UK GAAP), FP&A, Corporate Finance
+
+defaults:
+  results_per_site: 75
+  hours_old: 96
+  country_indeed: "uk"
+
+sites:
+  - linkedin
+  - indeed
+  - glassdoor
+  - google
+
+queries:
+  # Tier 1: High-Precision ACA / Chartered Accountant & Audit / Reporting Roles
+  - query: "ACA Accountant"
+    tier: 1
+  - query: "Chartered Accountant"
+    tier: 1
+  - query: "Qualified Accountant ACA"
+    tier: 1
+  - query: "Audit Senior"
+    tier: 1
+  - query: "Audit Assistant Manager"
+    tier: 1
+  - query: "Audit Manager"
+    tier: 1
+  - query: "Financial Reporting Accountant"
+    tier: 1
+  - query: "IFRS Reporting Accountant"
+    tier: 1
+  - query: "Group Reporting Accountant"
+    tier: 1
+  - query: "Technical Accountant"
+    tier: 1
+
+  # Tier 2: FP&A, Financial Accounting, Internal Audit & SOX
+  - query: "FP&A Analyst"
+    tier: 2
+  - query: "Financial Planning and Analysis"
+    tier: 2
+  - query: "Commercial Finance Analyst"
+    tier: 2
+  - query: "Financial Accountant"
+    tier: 2
+  - query: "Management Accountant"
+    tier: 2
+  - query: "Finance Manager"
+    tier: 2
+  - query: "Statutory Accountant"
+    tier: 2
+  - query: "Internal Auditor"
+    tier: 2
+  - query: "SOX Compliance Analyst"
+    tier: 2
+
+  # Tier 3: Fund Accounting, Advisory & Transaction Services
+  - query: "Fund Accountant"
+    tier: 3
+  - query: "Financial Controller"
+    tier: 3
+  - query: "Transaction Services"
+    tier: 3
+  - query: "Financial Due Diligence"
+    tier: 3
+  - query: "External Audit"
+    tier: 3
+
+locations:
+  # UK Financial & Audit Hubs
+  - label: "London, UK"
+    location: "London, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - label: "UK Remote"
+    location: "United Kingdom"
+    country_indeed: "uk"
+    remote: true
+  - label: "Manchester, UK"
+    location: "Manchester, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - label: "Edinburgh, UK"
+    location: "Edinburgh, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - label: "Birmingham, UK"
+    location: "Birmingham, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+  - label: "Bristol, UK"
+    location: "Bristol, United Kingdom"
+    country_indeed: "uk"
+    remote: false
+
+  # Tier 1 EU Finance & Audit Capitals
+  - label: "Dublin, Ireland"
+    location: "Dublin, Ireland"
+    country_indeed: "ireland"
+    remote: false
+  - label: "Luxembourg"
+    location: "Luxembourg"
+    country_indeed: "luxembourg"
+    remote: false
+  - label: "Amsterdam, Netherlands"
+    location: "Amsterdam, Netherlands"
+    country_indeed: "netherlands"
+    remote: false
+  - label: "Frankfurt, Germany"
+    location: "Frankfurt, Germany"
+    country_indeed: "germany"
+    remote: false
+  - label: "Munich, Germany"
+    location: "Munich, Germany"
+    country_indeed: "germany"
+    remote: false
+  - label: "Berlin, Germany"
+    location: "Berlin, Germany"
+    country_indeed: "germany"
+    remote: false
+
+  # Tier 2/3 EU & Switzerland Financial Hubs
+  - label: "Zurich, Switzerland"
+    location: "Zurich, Switzerland"
+    country_indeed: "switzerland"
+    remote: false
+  - label: "Geneva, Switzerland"
+    location: "Geneva, Switzerland"
+    country_indeed: "switzerland"
+    remote: false
+  - label: "Brussels, Belgium"
+    location: "Brussels, Belgium"
+    country_indeed: "belgium"
+    remote: false
+  - label: "Stockholm, Sweden"
+    location: "Stockholm, Sweden"
+    country_indeed: "sweden"
+    remote: false
+  - label: "Copenhagen, Denmark"
+    location: "Copenhagen, Denmark"
+    country_indeed: "denmark"
+    remote: false
+  - label: "Paris, France"
+    location: "Paris, France"
+    country_indeed: "france"
+    remote: false
+  - label: "Madrid, Spain"
+    location: "Madrid, Spain"
+    country_indeed: "spain"
+    remote: false
+  - label: "Barcelona, Spain"
+    location: "Barcelona, Spain"
+    country_indeed: "spain"
+    remote: false
+  - label: "Lisbon, Portugal"
+    location: "Lisbon, Portugal"
+    country_indeed: "portugal"
+    remote: false
+  - label: "Warsaw, Poland"
+    location: "Warsaw, Poland"
+    country_indeed: "poland"
+    remote: false
+  - label: "Krakow, Poland"
+    location: "Krakow, Poland"
+    country_indeed: "poland"
+    remote: false
+  - label: "Vienna, Austria"
+    location: "Vienna, Austria"
+    country_indeed: "austria"
+    remote: false
+  - label: "Milan, Italy"
+    location: "Milan, Italy"
+    country_indeed: "italy"
+    remote: false
+
+location:
+  accept_patterns:
+    - "United Kingdom"
+    - "UK"
+    - "England"
+    - "Scotland"
+    - "London"
+    - "Manchester"
+    - "Edinburgh"
+    - "Birmingham"
+    - "Bristol"
+    - "Leeds"
+    - "Reading"
+    - "Cambridge"
+    - "Ireland"
+    - "Dublin"
+    - "Cork"
+    - "Galway"
+    - "Luxembourg"
+    - "Netherlands"
+    - "Amsterdam"
+    - "Rotterdam"
+    - "The Hague"
+    - "Utrecht"
+    - "Germany"
+    - "Frankfurt"
+    - "Munich"
+    - "Berlin"
+    - "Dusseldorf"
+    - "Hamburg"
+    - "Switzerland"
+    - "Zurich"
+    - "Geneva"
+    - "Basel"
+    - "Zug"
+    - "Belgium"
+    - "Brussels"
+    - "Sweden"
+    - "Stockholm"
+    - "Denmark"
+    - "Copenhagen"
+    - "France"
+    - "Paris"
+    - "Spain"
+    - "Madrid"
+    - "Barcelona"
+    - "Portugal"
+    - "Lisbon"
+    - "Austria"
+    - "Vienna"
+    - "Poland"
+    - "Warsaw"
+    - "Krakow"
+    - "Italy"
+    - "Milan"
+    - "Malta"
+    - "Cyprus"
+    - "Channel Islands"
+    - "Jersey"
+    - "Guernsey"
+    - "Europe"
+    - "EU"
+    - "EMEA"
+    - "Remote"
+    - "Anywhere"
+  reject_patterns:
+    - "US Citizen only"
+    - "Active TS/SCI"
+    - "DV Clearance required"
+    - "SC Clearance required"
+    - "United States only"
+    - "Canada only"
+
+exclude_titles:
+  - "intern"
+  - "internship"
+  - "werkstudent"
+  - "praktikum"
+  - "apprentice"
+  - "accounts payable clerk"
+  - "bookkeeper"
+  - "payroll clerk"
+  - "security clearance required"

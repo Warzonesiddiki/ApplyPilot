@@ -5,12 +5,14 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-from applypilot.config import DB_PATH
+from applypilot import config
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -21,17 +23,17 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     """Get a thread-local cached SQLite connection with WAL mode enabled.
 
     Each thread gets its own connection (required for SQLite thread safety).
-    Connections are cached and reused within the same thread.
+    Connections are cached and reused within the same thread, keyed by resolved path.
 
     Args:
-        db_path: Override the default DB_PATH. Useful for testing.
+        db_path: Override the default active profile DB_PATH. Useful for testing.
 
     Returns:
         sqlite3.Connection configured with WAL mode and row factory.
     """
-    path = str(db_path or DB_PATH)
+    path = str(db_path or config.DB_PATH)
 
-    if not hasattr(_local, 'connections'):
+    if not hasattr(_local, "connections"):
         _local.connections = {}
 
     conn = _local.connections.get(path)
@@ -40,8 +42,9 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             conn.execute("SELECT 1")
             return conn
         except sqlite3.ProgrammingError:
-            pass
+            _local.connections.pop(path, None)
 
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
@@ -52,8 +55,8 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 def close_connection(db_path: Path | str | None = None) -> None:
     """Close the cached connection for the current thread."""
-    path = str(db_path or DB_PATH)
-    if hasattr(_local, 'connections'):
+    path = str(db_path or config.DB_PATH)
+    if hasattr(_local, "connections"):
         conn = _local.connections.pop(path, None)
         if conn is not None:
             conn.close()
@@ -66,10 +69,10 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     so it won't destroy existing data.
 
     Schema columns by stage:
-      - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
+      - Discovery:  url, title, company, salary, description, location, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
       - Scoring:    fit_score, score_reasoning, scored_at
-      - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
+      - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts, pdf_generated_at
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
@@ -81,7 +84,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     Returns:
         sqlite3.Connection with the schema initialized.
     """
-    path = db_path or DB_PATH
+    path = db_path or config.DB_PATH
 
     # Ensure parent directory exists
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +95,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Discovery stage (smart_extract / job_search)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
@@ -110,10 +114,11 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             score_reasoning       TEXT,
             scored_at             TEXT,
 
-            -- Tailoring stage (resume tailor)
+            -- Tailoring stage (resume tailor + PDF)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
             tailor_attempts       INTEGER DEFAULT 0,
+            pdf_generated_at      TEXT,
 
             -- Cover letter stage
             cover_letter_path     TEXT,
@@ -147,6 +152,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
@@ -166,6 +172,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
     "tailor_attempts": "INTEGER DEFAULT 0",
+    "pdf_generated_at": "TEXT",
     # Cover letter
     "cover_letter_path": "TEXT",
     "cover_letter_at": "TEXT",
@@ -189,9 +196,6 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     Reads the current table schema via PRAGMA table_info and compares against
     the full column registry. Any missing columns are added with ALTER TABLE.
 
-    This makes it safe to upgrade the database from any previous version --
-    columns are only added, never removed or renamed.
-
     Args:
         conn: Database connection. Uses get_connection() if None.
 
@@ -206,8 +210,6 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
 
     for col, dtype in _ALL_COLUMNS.items():
         if col not in existing:
-            # PRIMARY KEY columns can't be added via ALTER TABLE, but url
-            # is always created with the table itself so this is safe
             if "PRIMARY KEY" in dtype:
                 continue
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {dtype}")
@@ -222,17 +224,11 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     """Return job counts by pipeline stage.
 
-    Provides a snapshot of how many jobs are at each stage, useful for
-    dashboard display and pipeline progress tracking.
-
     Args:
         conn: Database connection. Uses get_connection() if None.
 
     Returns:
-        Dictionary with keys:
-            total, by_site, pending_detail, with_description,
-            scored, unscored, tailored, untailored_eligible,
-            with_cover_letter, applied, score_distribution
+        Dictionary with pipeline stage counts.
     """
     if conn is None:
         conn = get_connection()
@@ -326,20 +322,24 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     return stats
 
 
-def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
-               site: str, strategy: str) -> tuple[int, int]:
+def store_jobs(
+    conn: sqlite3.Connection,
+    jobs: list[dict],
+    site: str,
+    strategy: str,
+) -> tuple[int, int]:
     """Store discovered jobs, skipping duplicates by URL.
 
     Args:
         conn: Database connection.
-        jobs: List of job dicts with keys: url, title, salary, description, location.
+        jobs: List of job dicts with keys: url, title, company, salary, description, location.
         site: Source site name (e.g. "RemoteOK", "Dice").
         strategy: Extraction strategy used (e.g. "json_ld", "api_response", "css_selectors").
 
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
 
@@ -349,10 +349,19 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    url,
+                    job.get("title"),
+                    job.get("company") or site,
+                    job.get("salary"),
+                    job.get("description"),
+                    job.get("location"),
+                    site,
+                    strategy,
+                    now,
+                ),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -362,15 +371,17 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     return new, existing
 
 
-def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
-                      stage: str = "discovered",
-                      min_score: int | None = None,
-                      limit: int = 100) -> list[dict]:
+def get_jobs_by_stage(
+    conn: sqlite3.Connection | None = None,
+    stage: str = "discovered",
+    min_score: int | None = None,
+    limit: int = 100,
+) -> list[dict]:
     """Fetch jobs filtered by pipeline stage.
 
     Args:
         conn: Database connection. Uses get_connection() if None.
-        stage: One of "discovered", "enriched", "scored", "tailored", "applied".
+        stage: One of "discovered", "enriched", "scored", "tailored", "applied", etc.
         min_score: Minimum fit_score filter (only relevant for scored+ stages).
         limit: Maximum number of rows to return.
 
@@ -417,7 +428,6 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     rows = conn.execute(query, params).fetchall()
 
-    # Convert sqlite3.Row objects to dicts
     if rows:
         columns = rows[0].keys()
         return [dict(zip(columns, row)) for row in rows]

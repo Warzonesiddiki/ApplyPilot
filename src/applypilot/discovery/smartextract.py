@@ -19,18 +19,16 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import UTC, datetime
 from urllib.parse import quote_plus
 
-import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import get_stats, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -50,27 +48,12 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 def _load_location_filter(search_cfg: dict | None = None):
     """Load location accept/reject lists from search config."""
-    if search_cfg is None:
-        search_cfg = config.load_search_config()
-    accept = search_cfg.get("location_accept", [])
-    reject = search_cfg.get("location_reject_non_remote", [])
-    return accept, reject
+    return config.load_location_filters(search_cfg)
 
 
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter."""
-    if not location:
-        return True
-    loc = location.lower()
-    if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
-        return True
-    for r in reject:
-        if r.lower() in loc:
-            return False
-    for a in accept:
-        if a.lower() in loc:
-            return True
-    return False
+    return config.is_location_allowed(location, accept=accept, reject=reject)
 
 
 # -- Site configuration from YAML --------------------------------------------
@@ -94,7 +77,7 @@ def _store_jobs_filtered(
     reject_locs: list[str],
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new = 0
     existing = 0
     filtered = 0
@@ -108,9 +91,9 @@ def _store_jobs_filtered(
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), job.get("company") or site, job.get("salary"), job.get("description"),
                  job.get("location"), site, strategy, now),
             )
             new += 1
@@ -424,7 +407,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -855,7 +838,11 @@ def _run_one_site(name: str, url: str) -> dict:
     # Step 1: Collect intelligence
     log.info("[1] Collecting page intelligence...")
     t0 = time.time()
-    intel = collect_page_intelligence(url)
+    try:
+        intel = collect_page_intelligence(url)
+    except Exception as e:
+        log.error("Failed collecting page intelligence for %s: %s", name, e)
+        return {"name": name, "status": "FETCH_ERROR", "error": str(e), "jobs": [], "total": 0, "titles": 0}
     collect_time = time.time() - t0
     log.info("Done in %.1fs | JSON-LD: %d | API: %d | testids: %d | cards: %d",
              collect_time, len(intel["json_ld"]), len(intel["api_responses"]),
@@ -1052,7 +1039,11 @@ def _run_all(
             }
             for future in as_completed(future_to_target):
                 target = future_to_target[future]
-                r = future.result()
+                try:
+                    r = future.result()
+                except Exception as e:
+                    log.error("Site worker crashed for %s: %s", target["name"], e)
+                    r = {"name": target["name"], "status": "CRASH", "error": str(e), "jobs": [], "total": 0, "titles": 0}
                 results.append(r)
                 _process_result(r, target)
     else:

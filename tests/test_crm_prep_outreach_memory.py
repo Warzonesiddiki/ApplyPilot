@@ -206,7 +206,8 @@ def test_email_sync_lifecycle_and_native_proof_engine(tmp_path: Path, monkeypatc
     from applypilot.email_sync import classify_application_email, sync_application_emails
 
     monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
-    runner.invoke(app, ["init", "-p", "neha", "-t", "neha"])
+    res = runner.invoke(app, ["init", "-p", "neha", "-t", "neha"])
+    assert res.exit_code == 0
     config.set_active_profile("neha")
     conn = database.init_db()
     database.store_jobs(
@@ -327,8 +328,6 @@ def test_email_sync_lifecycle_and_native_proof_engine(tmp_path: Path, monkeypatc
 
     database.close_connection()
     config.set_active_profile(None)
-
-
 
 
 def test_reset_transient_failed_jobs_processes_backlogs_in_windows(

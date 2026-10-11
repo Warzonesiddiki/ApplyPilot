@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "pytest": {
+      "source": "codeatcode/oss-ai-skills",
+      "sourceType": "github",
+      "skillPath": "frameworks/pytest/SKILL.md",
+      "computedHash": "21bdd1d0b8ff03df0ab9a56e267969cc7f907420d5a7f0395c19e4f2d79bb331"
+    },
+    "testing-python-libraries": {
+      "source": "wdm0006/python-skills",
+      "sourceType": "github",
+      "skillPath": "skills/python/testing-strategy/SKILL.md",
+      "computedHash": "ab45178728f7914decdfb9a867205844b0d9474fe683d53600d6dbc64ffc24e1"
+    },
+    "typer": {
+      "source": "jamie-bitflight/claude_skills",
+      "sourceType": "github",
+      "skillPath": "plugins/python-engineering/skills/typer/SKILL.md",
+      "computedHash": "7242a517c2eaed0818aa2d888d0f3f1e7b76c631ca527ac16027489c35aa5b90"
+    },
+    "typer-and-rich": {
+      "source": "jamie-bitflight/claude_skills",
+      "sourceType": "github",
+      "skillPath": "plugins/python-engineering/skills/typer-and-rich/SKILL.md",
+      "computedHash": "0ca9e6d52bb694d73e3d30e1bf518e9b5e8234df846fb359b50b9cf58f71f531"
+    }
+  }
+}

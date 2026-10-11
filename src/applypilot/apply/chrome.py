@@ -9,10 +9,26 @@ import logging
 import platform
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+# Unix process-group primitives live behind a platform-conditional import so
+# they do not appear as missing attributes on Windows builds.
+
+if sys.platform == "win32":
+    _OS_UNIX: Any = None
+    _SIGNAL_UNIX: Any = None
+    _HAS_UNIX_PROCESS_API = False
+else:
+    import os as _os_unix
+    import signal as _signal_unix
+
+    _OS_UNIX = _os_unix
+    _SIGNAL_UNIX = _signal_unix
+    _HAS_UNIX_PROCESS_API = True
 
 from applypilot import config
 
@@ -37,8 +53,6 @@ def _kill_process_tree(pid: int) -> None:
     so taskkill /T is needed to kill the entire tree. On Unix, os.killpg
     handles the process group.
     """
-    import signal as _signal
-
     try:
         if platform.system() == "Windows":
             subprocess.run(
@@ -49,13 +63,15 @@ def _kill_process_tree(pid: int) -> None:
             )
         else:
             # Unix: kill entire process group
-            import os
+            if not _HAS_UNIX_PROCESS_API:
+                raise RuntimeError("Unix process-group kill is only supported on POSIX")
+
             try:
-                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+                _OS_UNIX.killpg(_OS_UNIX.getpgid(pid), _SIGNAL_UNIX.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 # Process already gone or owned by another user
                 try:
-                    os.kill(pid, _signal.SIGKILL)
+                    _OS_UNIX.kill(pid, _SIGNAL_UNIX.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
     except Exception:
@@ -67,8 +83,9 @@ def _kill_on_port(port: int) -> None:
 
     Uses netstat on Windows, lsof on macOS/Linux.
     """
+    tool = _get_port_scan_tool()
     try:
-        if platform.system() == "Windows":
+        if tool == "Windows":
             result = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
                 capture_output=True, text=True, timeout=10,
@@ -78,20 +95,47 @@ def _kill_on_port(port: int) -> None:
                     pid = line.strip().split()[-1]
                     if pid.isdigit():
                         _kill_process_tree(int(pid))
-        else:
-            # macOS / Linux
-            result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            for pid_str in result.stdout.strip().splitlines():
-                pid_str = pid_str.strip()
-                if pid_str.isdigit():
-                    _kill_process_tree(int(pid_str))
+            return
+
+        # macOS / Linux: parse ``lsof -ti :port`` output.
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for pid_str in result.stdout.strip().splitlines():
+            pid_str = pid_str.strip()
+            if pid_str.isdigit():
+                _kill_process_tree(int(pid_str))
     except FileNotFoundError:
         logger.debug("Port-kill tool not found (netstat/lsof) for port %d", port)
     except Exception:
         logger.debug("Failed to kill process on port %d", port, exc_info=True)
+
+
+def _resolve_port_scan_tool() -> str:
+    """Return which external port-scanning tool this platform attempts first.
+
+    Windows uses ``netstat``; macOS and Linux use ``lsof``. The value is
+    used by the liveliness probe in ``_kill_on_port`` and by tests that
+    script the port-kill path.
+    """
+    return "netstat" if platform.system() == "Windows" else "lsof"
+
+
+_PORT_SCAN_TOOL: str | None = None
+
+
+def _get_port_scan_tool() -> str:
+    """Return the cached port-scanning tool name, resolving once per process.
+
+    On Windows this is ``netstat``; on macOS and Linux it is ``lsof``.
+    ``_kill_on_port`` uses this helper so non-Windows tests can script the
+    lsof-parsing path without racing ``platform.system()`` at runtime.
+    """
+    global _PORT_SCAN_TOOL
+    if _PORT_SCAN_TOOL is None:
+        _PORT_SCAN_TOOL = _resolve_port_scan_tool()
+    return _PORT_SCAN_TOOL
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +283,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict[str, Any] = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if platform.system() != "Windows":
-        import os
-        kwargs["preexec_fn"] = os.setsid
+        if not _HAS_UNIX_PROCESS_API:
+            raise RuntimeError("Unix process-group launch is only supported on POSIX")
+        kwargs["preexec_fn"] = _OS_UNIX.setsid
 
     proc = subprocess.Popen[bytes](cmd, **kwargs)
     with _chrome_lock:

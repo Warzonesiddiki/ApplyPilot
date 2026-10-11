@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 import applypilot.apply.chrome as chrome
 import applypilot.config as config
+
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     cleanup_on_exit,
@@ -209,25 +209,53 @@ def test_kill_on_port_parses_lsof_output_and_kills_listeners(
     monkeypatch: pytest.MonkeyPatch,
     record_kills: list[int],
 ) -> None:
+    """Verify the non-Windows port-kill path parses lsof -ti output and kills
+    every listed PID.
+
+    The production helper ``_kill_on_port`` imports ``subprocess`` only under
+    the non-Windows branch, so this test wires a fake ``subprocess`` module
+    into the *same* namespace ``applypilot.apply.chrome`` uses at runtime.
+    """
     class _FakeCompleted:
         def __init__(self, stdout: str) -> None:
             self.stdout = stdout
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompleted:
-        assert cmd[:2] == ["lsof", "-ti"]
-        assert cmd[2] == ":9310"
-        return _FakeCompleted("1111\nnot-a-pid\n2222\n")
+    class _FakeSubprocess:
+        CompletedProcess: Any = _FakeCompleted
+        run: Any = staticmethod(
+            lambda cmd, **kwargs: _FakeCompleted(
+                "1111\nnot-a-pid\n2222\n"
+                if cmd[:2] == ["lsof", "-ti"] and len(cmd) > 2 and cmd[2] == ":9310"
+                else ""
+            )
+        )
 
-    monkeypatch.setattr("applypilot.apply.chrome.subprocess.run", fake_run)
+    import applypilot.apply.chrome as _chrome_under_test
+    monkeypatch.setattr(_chrome_under_test, "subprocess", _FakeSubprocess)
+    monkeypatch.setattr(
+        _chrome_under_test, "_resolve_port_scan_tool", lambda: "lsof"
+    )
     _kill_on_port(BASE_CDP_PORT + 88)
     assert record_kills == [1111, 2222]
 
 
-def test_kill_on_port_tolerates_missing_tools(monkeypatch: pytest.MonkeyPatch) -> None:
-    def missing_tool(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        raise FileNotFoundError("lsof not installed")
+def _assert_lsof_tool_is_scripted_for_port_kill_tests() -> None:
+    """Safety check used by the audit: the lsof-parsing path must be the one
+    under test, not the Windows netstat path."""
+    assert chrome._resolve_port_scan_tool() == "lsof"
 
-    monkeypatch.setattr("applypilot.apply.chrome.subprocess.run", missing_tool)
+def test_kill_on_port_tolerates_missing_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeSubprocess:
+        CompletedProcess: Any = subprocess.CompletedProcess
+        run: Any = staticmethod(
+            lambda cmd, **kwargs: (_ for _ in ()).throw(FileNotFoundError("lsof not installed"))
+        )
+
+    import applypilot.apply.chrome as _chrome_under_test
+    monkeypatch.setattr(_chrome_under_test, "subprocess", _FakeSubprocess)
+    monkeypatch.setattr(
+        _chrome_under_test, "_resolve_port_scan_tool", lambda: "lsof"
+    )
     _kill_on_port(12345)  # must not raise
 
 

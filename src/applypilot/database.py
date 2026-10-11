@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 from datetime import UTC, datetime
@@ -20,6 +21,19 @@ from typing import Any, BinaryIO, Protocol, cast
 from applypilot import config
 
 log = logging.getLogger(__name__)
+
+# Advisory writer-lock primitives are platform-specific. We import them at
+# module level behind explicit platform guards so static analyzers see real
+# attribute bindings instead of Unix-only names on Windows builds.
+
+if sys.platform == "win32":
+    _FCNTL: Any = None
+    _HAS_FCNTL = False
+else:
+    import fcntl as _fcntl_mod
+
+    _FCNTL = _fcntl_mod
+    _HAS_FCNTL = True
 
 # Thread-local connection storage — each thread gets its own connection.
 _local = threading.local()
@@ -96,7 +110,8 @@ class _SerializedSQLiteConnection(sqlite3.Connection):
                 handle.write(b"0")
                 handle.flush()
         else:
-            import fcntl
+            if not _HAS_FCNTL:
+                raise RuntimeError("Database writer locking is only supported on POSIX")
 
         deadline = time.monotonic() + _SQLITE_LOCK_TIMEOUT_SECONDS
         while True:
@@ -105,7 +120,7 @@ class _SerializedSQLiteConnection(sqlite3.Connection):
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 else:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
                 self._writer_lock_handle = handle
                 return
             except (BlockingIOError, OSError) as exc:
@@ -128,9 +143,10 @@ class _SerializedSQLiteConnection(sqlite3.Connection):
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                import fcntl
+                if not _HAS_FCNTL:
+                    raise RuntimeError("Database writer lock release is only supported on POSIX")
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_UN)
         finally:
             handle.close()
 

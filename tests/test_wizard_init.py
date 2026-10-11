@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -200,7 +201,8 @@ def test_setup_ai_features_gemini_branch_writes_restricted_env(
     env = config.ENV_PATH.read_text(encoding="utf-8")
     assert "GEMINI_API_KEY=AIza-test-key-123" in env
     assert "LLM_MODEL=gemini-2.0-flash" in env
-    assert (config.ENV_PATH.stat().st_mode & 0o777) == 0o600
+    if platform.system() != "Windows":
+        assert (config.ENV_PATH.stat().st_mode & 0o777) == 0o600
 
 
 def test_setup_ai_features_declined_leaves_env_untouched(

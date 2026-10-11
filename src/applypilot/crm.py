@@ -170,7 +170,9 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
         try:
             length = int(length_header)
         except (TypeError, ValueError):
-            length = 0
+            # Unsafe/inequivalent Content-Length gets refused before we touch
+            # the body so a misbehaving client cannot pin handler memory.
+            raise _RequestBodyTooLargeError(None) from None
         if length <= 0:
             return {}
         if length > _MAX_REQUEST_BODY_BYTES:

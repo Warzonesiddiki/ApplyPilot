@@ -41,12 +41,6 @@ dev = [
     "ruff>=0.1",
     "types-PyYAML>=6.0",
 ]
-# compatibility requirements for the skill/verification matrix
-"pytest-asyncio>=1.4.0",
-"pytest-mock>=3.16.0",
-
-
-[project.scripts]
 applypilot = "applypilot.cli:app"
 
 [project.urls]

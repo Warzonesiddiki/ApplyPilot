@@ -18,6 +18,13 @@ logs/
 # MCP configs (per-machine)
 .mcp*.json
 
+# Accidental artifacts from botched shell commands: a Windows path whose
+# backslashes were stripped lands here as e.g. Users<...>Libsite-packages/
+*Libsite-packages/
+
+# Freebuff session transcripts
+freebuff-chat-*.md
+
 # Python
 __pycache__/
 *.py[cod]

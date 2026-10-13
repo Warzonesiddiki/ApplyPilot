@@ -14,7 +14,28 @@ import pytest
 
 import applypilot.config as config
 import applypilot.database as database
-from applypilot.crm import _CRMRequestHandler, _ReusableThreadingHTTPServer, update_job_crm_stage
+from applypilot.crm import (
+    _CRMRequestHandler,
+    _ReusableThreadingHTTPServer,
+    exposure_warning,
+    update_job_crm_stage,
+)
+
+
+def test_crm_loopback_default_and_warn_on_wider_binding() -> None:
+    assert exposure_warning("127.0.0.1") is None
+    assert exposure_warning("localhost") is None
+    assert exposure_warning("::1") is None
+
+    warn = exposure_warning("0.0.0.0")
+    assert warn is not None
+    assert "exposes" in warn
+    assert "personal data" in warn
+
+    warn = exposure_warning("192.168.1.2")
+    assert warn is not None
+    assert "exposes" in warn
+
 
 _PROFILE: dict[str, Any] = {
     "personal": {
@@ -32,6 +53,43 @@ _PROFILE: dict[str, Any] = {
     },
     "skills_boundary": {"Audit": ["IFRS", "UK GAAP", "External Audit"]},
 }
+
+
+def test_crm_readable_envelope(tmp_path: Path) -> None:
+    """GET / returns a loadable HTML envelope even on an empty profile so the
+    web UI is usable from a fresh install before any jobs exist.
+    """
+    tmp = tmp_path / "crm-empty-envelope"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("APPLYPILOT_DIR", str(tmp))
+    config.set_active_profile("empty-envelope-tests")
+    config.ensure_dirs()
+    config.RESUME_PATH.write_text("Neha Tariq, ACA. Audit experience.", encoding="utf-8")
+    config.PROFILE_PATH.write_text(json.dumps(_PROFILE), encoding="utf-8")
+    conn = database.init_db()
+    database.ensure_columns(conn)
+    conn.commit()
+    database.close_connection()
+    try:
+        server = _ReusableThreadingHTTPServer(("127.0.0.1", 0), _CRMRequestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = int(server.server_address[1])
+        resp = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0)
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        text = resp.text
+        assert "<html" in text.lower()
+        assert "<head>" in text
+        assert "</script>" in text
+        assert "updateJobStage" in text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+        database.close_connection()
+        config.set_active_profile(None)
+        monkeypatch.undo()
 
 
 @pytest.fixture()

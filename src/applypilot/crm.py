@@ -1,7 +1,7 @@
 """Interactive Career CRM Web Server & Stage Manager (`applypilot serve`).
 
-Serves the interactive Career CRM dashboard on `0.0.0.0` (compatible with both
-local desktop browsers and remote sandboxed previews) and exposes REST endpoints
+Serves the interactive Career CRM dashboard on loopback by default (pass
+`--host 0.0.0.0` to expose it to other machines) and exposes REST endpoints
 for updating CRM stages (`discovered`, `scored`, `tailored`, `ready`, `applied`,
 `assessment`, `interviewing`, `offer`, `rejected`), saving candidate notes,
 generating Interview Prep & Outreach packs on demand, and exporting CSV.
@@ -31,6 +31,10 @@ console = Console()
 class _RequestBodyTooLargeError(Exception):
     """A CRM request declared a body beyond the configured cap."""
 
+    def __init__(self, length: int | None) -> None:
+        super().__init__(length)
+        self.length = length
+
 VALID_CRM_STAGES: tuple[str, ...] = (
     "discovered",
     "enriched",
@@ -50,6 +54,10 @@ VALID_CRM_STAGES: tuple[str, ...] = (
 # triggers). Anything larger is rejected before the body is read so a
 # misbehaving client cannot pin handler memory.
 _MAX_REQUEST_BODY_BYTES = 1_000_000
+# When refusing an oversized body the remaining bytes are discarded in bounded
+# chunks (see _drain_request_body) so the client can still read the 413.
+_DRAIN_CHUNK_BYTES = 64 * 1024
+_MAX_DRAIN_BYTES = 8 * 1024 * 1024
 
 
 def update_job_crm_stage(
@@ -158,13 +166,31 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
 
         self._send_json(404, {"error": "Not found"})
 
+    def _drain_request_body(self, length: int | None) -> None:
+        """Discard an unread request body so the client can read our response.
+
+        Closing a socket while unread bytes are still queued makes the OS send
+        RST, which discards the pending response and surfaces as a read error on
+        the client. Reading and discarding in bounded chunks keeps memory flat
+        while letting the status line through.
+        """
+        if not length or length <= 0:
+            return
+        remaining = min(length, _MAX_DRAIN_BYTES)
+        while remaining > 0:
+            chunk = self.rfile.read(min(_DRAIN_CHUNK_BYTES, remaining))
+            if not chunk:
+                return
+            remaining -= len(chunk)
+
     def _read_json_object_body(self) -> dict[str, Any]:
         """Read the request body as a small JSON object.
 
         Missing, empty, unparsable, or non-object bodies return ``{}`` so a
         malformed request degrades to a validation error instead of crashing
-        the handler thread. Oversized bodies are refused with HTTP 413 before
-        any bytes are read.
+        the handler thread. Oversized bodies are rejected once the declared
+        length is known, without buffering them in memory; the caller drains the
+        remaining bytes before replying so the 413 is actually delivered.
         """
         length_header = self.headers.get("Content-Length", "0")
         try:
@@ -188,7 +214,10 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             payload = self._read_json_object_body()
-        except _RequestBodyTooLargeError:
+        except _RequestBodyTooLargeError as exc:
+            # Discard what the client is still sending before replying, otherwise
+            # the connection is reset and the 413 never reaches it.
+            self._drain_request_body(exc.length)
             self._send_json(413, {"error": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"})
             return
 
@@ -279,14 +308,39 @@ class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def serve_crm(host: str = "0.0.0.0", port: int = 8080) -> None:
+# Hosts that keep the CRM reachable only from this machine.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def exposure_warning(host: str) -> str | None:
+    """Return a warning when ``host`` publishes the CRM beyond this machine.
+
+    The Career CRM holds personal data (contact details, notes, recruiter
+    emails, application history), so binding to a routable interface is opt-in:
+    loopback is the default and anything wider tells the user what they chose.
+    """
+    if host.strip().lower() in _LOOPBACK_HOSTS:
+        return None
+    return (
+        f"[yellow]Warning:[/yellow] binding to [bold]{host}[/bold] exposes your Career CRM "
+        "(personal data, notes, and application history) to other machines on this network.\n"
+        "[dim]Use --host 127.0.0.1 for local-only access.[/dim]"
+    )
+
+
+def serve_crm(host: str = "127.0.0.1", port: int = 8080) -> None:
     """Start the local interactive Career CRM web server."""
     init_db()
     close_connection()
+    warning = exposure_warning(host)
+    if warning is not None:
+        console.print(warning)
     server = _ReusableThreadingHTTPServer((host, port), _CRMRequestHandler)
     prof = config.get_active_profile() or "default"
+    # 0.0.0.0/:: are bind-any addresses, not browsable ones.
+    browsable = "localhost" if host in {"0.0.0.0", "::"} else host
     console.print(
-        f"[bold green]ApplyPilot Career CRM Server running at http://{host}:{port}[/bold green] "
+        f"[bold green]ApplyPilot Career CRM Server running at http://{browsable}:{port}[/bold green] "
         f"(active profile: [cyan]{prof}[/cyan])\n"
         "[dim]Press Ctrl+C to stop.[/dim]"
     )

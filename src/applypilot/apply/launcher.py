@@ -26,6 +26,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot.apply import capsolver
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
@@ -74,24 +75,94 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
+# Claude Code built-in tools the unattended apply agent must never hold.
+# The agent reads untrusted employer/aggregator pages, so shell, filesystem, and
+# outbound-web access would let a prompt injection execute code, tamper with
+# files, or exfiltrate credentials. The application flow is driven entirely by
+# the Playwright MCP browser tools, so blocking these is safe as well as safer.
+_DISALLOWED_BUILTIN_TOOLS: tuple[str, ...] = (
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+)
+
+# Gmail MCP tools that must stay read-only (drafting/sending/deleting is not part
+# of the application flow).
+_DISALLOWED_GMAIL_TOOLS: tuple[str, ...] = (
+    "mcp__gmail__draft_email",
+    "mcp__gmail__modify_email",
+    "mcp__gmail__delete_email",
+    "mcp__gmail__download_attachment",
+    "mcp__gmail__batch_modify_emails",
+    "mcp__gmail__batch_delete_emails",
+    "mcp__gmail__create_label",
+    "mcp__gmail__update_label",
+    "mcp__gmail__delete_label",
+    "mcp__gmail__get_or_create_label",
+    "mcp__gmail__list_email_labels",
+    "mcp__gmail__create_filter",
+    "mcp__gmail__list_filters",
+    "mcp__gmail__get_filter",
+    "mcp__gmail__delete_filter",
+)
+
+# MCP tool names exposed by the bundled CapSolver server.
+CAPSOLVER_MCP_SERVER_NAME = "capsolver"
+
+
+def _build_claude_command(model: str, mcp_config_path: Path) -> list[str]:
+    """Build the Claude Code CLI invocation for one unattended application.
+
+    ``bypassPermissions`` is required because the agent runs unattended, so the
+    safety boundary is the disallowed-tool list rather than an interactive
+    prompt. See ``_DISALLOWED_BUILTIN_TOOLS``.
+    """
+    disallowed = _DISALLOWED_BUILTIN_TOOLS + _DISALLOWED_GMAIL_TOOLS
+    return [
+        "claude",
+        "--model", model,
+        "-p",
+        "--mcp-config", str(mcp_config_path),
+        "--permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+        "--disallowedTools", ",".join(disallowed),
+        "--output-format", "stream-json",
+        "--verbose", "-",
+    ]
+
+
 def _make_mcp_config(cdp_port: int) -> dict[str, Any]:
     """Build MCP config dict for a specific CDP port."""
-    return {
-        "mcpServers": {
-            "playwright": {
-                "command": "npx",
-                "args": [
-                    "@playwright/mcp@latest",
-                    f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={config.DEFAULTS['viewport']}",
-                ],
-            },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
-        }
+    config.load_env()
+    servers: dict[str, Any] = {
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "@playwright/mcp@latest",
+                f"--cdp-endpoint=http://localhost:{cdp_port}",
+                f"--viewport-size={config.DEFAULTS['viewport']}",
+            ],
+        },
+        "gmail": {
+            "command": "npx",
+            "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+        },
     }
+    # Registered only when a key is configured. The CapSolver credential then
+    # lives in this process instead of being interpolated into page JavaScript.
+    if capsolver.is_configured():
+        servers[CAPSOLVER_MCP_SERVER_NAME] = {
+            "command": sys.executable,
+            "args": ["-m", "applypilot.apply.capsolver_mcp"],
+        }
+    return {"mcpServers": servers}
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +408,7 @@ def run_job(job: dict[str, Any], port: int, worker_id: int = 0,
         tailored_resume=resume_text,
         dry_run=dry_run,
         worker_id=worker_id,
+        redact_secrets=True,
     )
 
     # Write per-worker MCP config
@@ -344,26 +416,7 @@ def run_job(job: dict[str, Any], port: int, worker_id: int = 0,
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
+    cmd = _build_claude_command(model, mcp_config_path)
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)

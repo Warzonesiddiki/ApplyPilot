@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot import __version__, config
+from applypilot import __version__, config, term
 from applypilot.config import TIER_COMMANDS, TIER_LABELS
 
 app = typer.Typer(
@@ -23,7 +23,49 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+# Legacy Windows code pages (cp1252/cp437) cannot encode glyphs such as ●/✓/✗.
+# Degrade them instead of raising UnicodeEncodeError and aborting the command.
+term.configure_stdio()
 console = Console()
+
+
+def _mark(unicode_text: str, ascii_fallback: str) -> str:
+    """Pick a status glyph the active console can actually render."""
+    return term.glyph(unicode_text, ascii_fallback, console.file)
+
+
+# Candidate profile templates: name -> (profile json, searches yaml, resume txt).
+PROFILE_TEMPLATES: dict[str, tuple[str, str, str]] = {
+    "tahir": (
+        "tahir_siddique.template.json",
+        "searches_tahir_eu_uk.yaml",
+        "tahir_siddique_resume.txt",
+    ),
+    "neha": (
+        "neha_tariq_aca.template.json",
+        "searches_neha_aca_eu_uk.yaml",
+        "neha_tariq_aca_resume.txt",
+    ),
+}
+
+
+def _profile_templates_dir() -> Path | None:
+    """Locate the bundled candidate profile templates.
+
+    Installed wheels ship them as package data next to the module; a source
+    checkout keeps them in ``docs/profiles`` at the repository root. Returns
+    ``None`` when neither location exists so the caller can fail with a clear
+    message instead of a traceback.
+    """
+    package_dir = Path(__file__).resolve().parent
+    candidates = (
+        package_dir / "templates" / "profiles",
+        package_dir.parents[1] / "docs" / "profiles",
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -95,35 +137,35 @@ def init(
 
     if template:
         tpl = template.strip().lower()
-        repo_docs = Path(__file__).resolve().parents[2] / "docs" / "profiles"
-        tpl_map = {
-            "tahir": (
-                "tahir_siddique.template.json",
-                "searches_tahir_eu_uk.yaml",
-                "tahir_siddique_resume.txt",
-            ),
-            "neha": (
-                "neha_tariq_aca.template.json",
-                "searches_neha_aca_eu_uk.yaml",
-                "neha_tariq_aca_resume.txt",
-            ),
-        }
-        if tpl not in tpl_map:
-            console.print(f"[red]Unknown template '{template}'. Choose 'tahir' or 'neha'.[/red]")
+        if tpl not in PROFILE_TEMPLATES:
+            console.print(
+                f"[red]Unknown template '{template}'. Choose {', '.join(sorted(PROFILE_TEMPLATES))}.[/red]"
+            )
             raise typer.Exit(1)
-        prof_file, search_file, resume_file = tpl_map[tpl]
+        templates_dir = _profile_templates_dir()
+        if templates_dir is None:
+            console.print(
+                "[red]Candidate templates not found — reinstall applypilot to restore them.[/red]"
+            )
+            raise typer.Exit(1)
+        prof_file, search_file, resume_file = PROFILE_TEMPLATES[tpl]
+        missing = [name for name in (prof_file, search_file) if not (templates_dir / name).is_file()]
+        if missing:
+            console.print(f"[red]Incomplete applypilot install — missing templates: {', '.join(missing)}[/red]")
+            console.print("[dim]Reinstall applypilot to restore the bundled templates.[/dim]")
+            raise typer.Exit(1)
         config.ensure_dirs()
         config.secure_write_text(
             config.PROFILE_PATH,
-            (repo_docs / prof_file).read_text(encoding="utf-8"),
+            (templates_dir / prof_file).read_text(encoding="utf-8"),
         )
         config.SEARCH_CONFIG_PATH.write_text(
-            (repo_docs / search_file).read_text(encoding="utf-8"),
+            (templates_dir / search_file).read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        if (repo_docs / resume_file).exists():
+        if (templates_dir / resume_file).is_file():
             config.RESUME_PATH.write_text(
-                (repo_docs / resume_file).read_text(encoding="utf-8"),
+                (templates_dir / resume_file).read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
         elif not config.RESUME_PATH.exists():
@@ -158,13 +200,17 @@ def profiles() -> None:
     table.add_column("Searches YAML", justify="center")
     table.add_column("Workspace Directory", style="dim")
 
+    active_mark = _mark("●", "*")
+    ok_mark = _mark("✓", "yes")
+    missing_mark = _mark("✗", "no")
+
     for item in items:
         table.add_row(
             item["name"],
-            "[green]●[/green]" if item["active"] else "",
-            "[green]✓[/green]" if item["has_profile"] else "[yellow]✗[/yellow]",
-            "[green]✓[/green]" if item["has_resume"] else "[yellow]✗[/yellow]",
-            "[green]✓[/green]" if item["has_searches"] else "[yellow]✗[/yellow]",
+            f"[green]{active_mark}[/green]" if item["active"] else "",
+            f"[green]{ok_mark}[/green]" if item["has_profile"] else f"[yellow]{missing_mark}[/yellow]",
+            f"[green]{ok_mark}[/green]" if item["has_resume"] else f"[yellow]{missing_mark}[/yellow]",
+            f"[green]{ok_mark}[/green]" if item["has_searches"] else f"[yellow]{missing_mark}[/yellow]",
             item["app_dir"],
         )
 
@@ -486,7 +532,8 @@ def status(
             count = dist_dict[score]
             bar_len = int((count / max_count) * 30)
             color = "green" if score >= 7 else ("yellow" if score >= 5 else "dim")
-            dist_table.add_row(str(score), str(count), f"[{color}]{'█' * bar_len}[/{color}]")
+            bar_char = _mark("█", "#")
+            dist_table.add_row(str(score), str(count), f"[{color}]{bar_char * bar_len}[/{color}]")
         console.print(dist_table)
 
     close_connection()
@@ -609,6 +656,13 @@ def export(
 ) -> None:
     """Export pipeline jobs to CSV, JSON, or Markdown."""
     _activate_profile_if_set(profile)
+    clean_fmt = fmt.strip().lower()
+    if clean_fmt not in ("csv", "json", "md", "markdown"):
+        console.print(
+            f"[red]Unsupported export format '{fmt}'.[/red] "
+            "Choose [bold]csv[/bold], [bold]json[/bold], or [bold]markdown[/bold]."
+        )
+        raise typer.Exit(1)
     config.require_init()
     from applypilot.database import close_connection, init_db
     from applypilot.export import export_jobs
@@ -844,9 +898,9 @@ def doctor(
         label = TIER_LABELS[t]
         cmds = ", ".join(c for c in TIER_COMMANDS[t])
         if t <= tier:
-            tier_lines.append(f"  [green]✓ Tier {t} — {label}[/green]  ({cmds})")
+            tier_lines.append(f"  [green]{_mark('✓', 'yes')} Tier {t} — {label}[/green]  ({cmds})")
         else:
-            tier_lines.append(f"  [dim]✗ Tier {t} — {label}  ({cmds})[/dim]")
+            tier_lines.append(f"  [dim]{_mark('✗', 'no')} Tier {t} — {label}  ({cmds})[/dim]")
 
     if tier == 0:
         summary_title = "[yellow]Not initialized — run 'applypilot init' to get started[/yellow]"

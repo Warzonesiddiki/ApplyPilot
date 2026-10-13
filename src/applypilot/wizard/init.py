@@ -19,9 +19,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 
-from applypilot import config
+from applypilot import config, term
 
 console = Console()
+
+
+def _mark(unicode_text: str, ascii_fallback: str) -> str:
+    """Pick a status glyph the active console can actually render."""
+    return term.glyph(unicode_text, ascii_fallback, console.file)
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +429,11 @@ def run_wizard() -> None:
         label = config.TIER_LABELS[t]
         cmds = ", ".join(f"[bold]{c}[/bold]" for c in config.TIER_COMMANDS[t])
         if t <= tier:
-            tier_lines.append(f"  [green]✓ Tier {t} — {label}[/green]  ({cmds})")
+            tier_lines.append(f"  [green]{_mark('✓', 'yes')} Tier {t} — {label}[/green]  ({cmds})")
         elif t == tier + 1:
-            tier_lines.append(f"  [yellow]→ Tier {t} — {label}[/yellow]  ({cmds})")
+            tier_lines.append(f"  [yellow]{_mark('→', '->')} Tier {t} — {label}[/yellow]  ({cmds})")
         else:
-            tier_lines.append(f"  [dim]✗ Tier {t} — {label}  ({cmds})[/dim]")
+            tier_lines.append(f"  [dim]{_mark('✗', 'no')} Tier {t} — {label}  ({cmds})[/dim]")
 
     unlock_hint = ""
     if tier == 1:

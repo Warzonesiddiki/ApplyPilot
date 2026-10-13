@@ -1,12 +1,16 @@
 name: CI
 
 on:
-  workflow_dispatch:  # manual trigger only
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
@@ -20,10 +24,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
 
-      - name: Lint
-        run: ruff check src/
+      - name: Lint (Ruff)
+        run: ruff check src/ tests/
 
-      - name: Test
+      - name: Type check (mypy)
+        run: mypy
+
+      - name: Test (pytest)
         run: pytest tests/ -v

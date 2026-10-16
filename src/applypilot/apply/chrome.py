@@ -78,6 +78,30 @@ def _kill_process_tree(pid: int) -> None:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
 
 
+def _netstat_listener_pid(line: str, port: int) -> str | None:
+    """Return the PID when a ``netstat -ano -p TCP`` line listens on ``port``.
+
+    The local address is compared on an exact port boundary: a substring test for
+    ``":9222"`` also matches ``:92220`` and the *remote* address of an outbound
+    connection, so ``kill_all_chrome`` could terminate an unrelated process tree.
+    Only loopback listeners are accepted -- Chrome's CDP endpoint is always local.
+    """
+    fields = line.split()
+    if len(fields) < 5:
+        return None
+    local_address, state, pid = fields[1], fields[3], fields[-1]
+    if state.upper() != "LISTENING" or not pid.isdigit():
+        return None
+    if ":" not in local_address:
+        return None
+    host, _, local_port = local_address.rpartition(":")
+    if local_port != str(port):
+        return None
+    if host not in ("127.0.0.1", "0.0.0.0", "::", "[::1]", "localhost", ""):
+        return None
+    return pid
+
+
 def _kill_on_port(port: int) -> None:
     """Kill any process listening on a specific port (zombie cleanup).
 
@@ -91,10 +115,9 @@ def _kill_on_port(port: int) -> None:
                 capture_output=True, text=True, timeout=10,
             )
             for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit():
-                        _kill_process_tree(int(pid))
+                pid = _netstat_listener_pid(line, port)
+                if pid is not None:
+                    _kill_process_tree(int(pid))
             return
 
         # macOS / Linux: parse ``lsof -ti :port`` output.

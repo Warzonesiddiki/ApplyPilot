@@ -9,11 +9,15 @@ generating Interview Prep & Outreach packs on demand, and exporting CSV.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 from pathlib import Path
+import re
 import sqlite3
+import threading
 from urllib.parse import parse_qs, urlparse
 from typing import Any
 
@@ -26,6 +30,7 @@ from applypilot.prep import find_target_job, generate_interview_prep, generate_o
 from applypilot.view import generate_dashboard
 
 console = Console()
+log = logging.getLogger(__name__)
 
 
 class _RequestBodyTooLargeError(Exception):
@@ -34,6 +39,10 @@ class _RequestBodyTooLargeError(Exception):
     def __init__(self, length: int | None) -> None:
         super().__init__(length)
         self.length = length
+
+
+class _InvalidProfileError(Exception):
+    """A CRM request named a profile that is not a safe workspace slug."""
 
 VALID_CRM_STAGES: tuple[str, ...] = (
     "discovered",
@@ -58,6 +67,47 @@ _MAX_REQUEST_BODY_BYTES = 1_000_000
 # chunks (see _drain_request_body) so the client can still read the 413.
 _DRAIN_CHUNK_BYTES = 64 * 1024
 _MAX_DRAIN_BYTES = 8 * 1024 * 1024
+
+# A profile name becomes a filesystem path segment (`<base>/profiles/<name>`),
+# and this server has no authentication at all: anyone who can reach it can send
+# `?profile=...`. So a profile slug is restricted to a single, boring path
+# segment - lowercase letters, digits, `-` and `_`, starting alphanumeric and
+# capped at 64 characters. Anything with a separator, a traversal segment, a
+# drive letter, or a null byte is refused before it reaches the filesystem.
+_PROFILE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# `config.set_active_profile` mutates process-wide state (an environment variable
+# plus the module-level path constants) while `ThreadingHTTPServer` handles
+# requests concurrently. A request's profile is therefore pinned on a thread
+# local for the duration of that request and the previous value is restored
+# afterwards, so two in-flight requests cannot bleed into each other.
+_request_local = threading.local()
+
+
+def _is_valid_profile_slug(value: str) -> bool:
+    """Return True when ``value`` is a safe single-segment profile slug."""
+    return bool(_PROFILE_SLUG_RE.match(value.strip().lower()))
+
+
+def _current_request_profile() -> str | None:
+    """Return the profile slug pinned for the request running on this thread."""
+    return getattr(_request_local, "profile", None)
+
+
+def _profile_dir_is_contained(app_dir: Path) -> bool:
+    """Return True when ``app_dir`` stays inside the managed ApplyPilot workspace.
+
+    Defence in depth behind :func:`_is_valid_profile_slug`: the resolved
+    workspace must be either the base directory (the default / root profile) or
+    a descendant of ``<base>/profiles``.
+    """
+    try:
+        resolved = app_dir.resolve()
+        base_root = config.BASE_APP_DIR.resolve()
+        profiles_root = config.PROFILES_DIR.resolve()
+    except OSError:
+        return False
+    return resolved == base_root or resolved == profiles_root or profiles_root in resolved.parents
 
 
 def update_job_crm_stage(
@@ -102,23 +152,131 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return  # Keep console output clean
 
+    # ------------------------------------------------------------------
+    # Origin / CORS (C5)
+    # ------------------------------------------------------------------
+
+    def _origin_allowed(self, origin: str) -> bool:
+        """Return True only when ``origin`` is exactly this server's own origin.
+
+        The CRM is unauthenticated and reachable over loopback, so a blanket
+        ``Access-Control-Allow-Origin: *`` would let any website the user visits
+        read ``/api/jobs`` - the whole database, including ``user_notes`` - with
+        a simple cross-origin GET. Only an ``Origin`` whose ``host:port`` equals
+        the request's own ``Host`` header counts as same-origin. Requests without
+        an ``Origin`` (the CLI, curl) carry no ambient browser authority and are
+        unaffected.
+        """
+        candidate = (origin or "").strip()
+        if not candidate:
+            return False
+        try:
+            parsed = urlparse(candidate)
+        except ValueError:
+            return False
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host_header = (self.headers.get("Host") or "").strip()
+        if not host_header:
+            return False
+        return parsed.netloc.lower() == host_header.lower()
+
+    def _cors_headers(self) -> dict[str, str]:
+        """Return same-origin CORS headers only - never a wildcard ACAO."""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin or not self._origin_allowed(origin):
+            return {}
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+
+    def _origin_is_foreign(self) -> bool:
+        """Return True when a request declares an Origin that is not us."""
+        origin = (self.headers.get("Origin") or "").strip()
+        return bool(origin) and not self._origin_allowed(origin)
+
     def _send_json(self, status: int, data: Mapping[str, Any] | list[Any]) -> None:
         payload: dict[str, Any] | list[Any] = dict(data) if isinstance(data, Mapping) else data
         raw = json.dumps(payload, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            for header, value in self._cors_headers().items():
+                self.send_header(header, value)
+            self.end_headers()
+            self.wfile.write(raw)
+        except OSError:
+            # Client vanished mid-response; there is nothing left to say and the
+            # traceback would only be noise.
+            log.debug("CRM client disconnected before the %d response was delivered", status, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Request-scoped profile selection (C1)
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _scoped_profile(self, raw_profile: str | None) -> Iterator[None]:
+        """Validate and pin a requested profile for the duration of one request.
+
+        Refuses anything that is not a safe slug, or that resolves outside the
+        ApplyPilot workspace, with :class:`_InvalidProfileError` - so no
+        directory, SQLite database, or ``dashboard.html`` is ever created at an
+        attacker-chosen path. The previously active profile is always restored.
+        """
+        requested = (raw_profile or "").strip()
+        previous = config.get_active_profile()
+        if not requested:
+            _request_local.profile = previous
+            try:
+                yield
+            finally:
+                _request_local.profile = None
+            return
+
+        slug = requested.lower()
+        if not _is_valid_profile_slug(slug):
+            raise _InvalidProfileError(
+                "profile must be a slug of 1-64 characters: a-z, 0-9, '-' or '_', starting with a letter or digit"
+            )
+        app_dir = config.set_active_profile(slug)
+        if not _profile_dir_is_contained(app_dir):
+            log.warning("Refused CRM request for profile %r resolving to %s", slug, app_dir)
+            config.set_active_profile(previous)
+            raise _InvalidProfileError("profile resolves outside the ApplyPilot workspace")
+
+        _request_local.profile = slug
+        try:
+            yield
+        finally:
+            _request_local.profile = None
+            try:
+                # Drop the workspace connection cached for this thread so the
+                # restored profile cannot reuse the request profile's handle.
+                close_connection()
+            finally:
+                config.set_active_profile(previous)
+
+    def _requested_profile_from_query(self, qs: Mapping[str, list[str]]) -> str:
+        """Return the first ``profile`` query value, or "" when absent/blank."""
+        values = qs.get("profile") or []
+        return values[0] if values else ""
 
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._handle_get()
+        except _InvalidProfileError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except Exception:  # noqa: BLE001 - never leak a traceback to the client
+            log.exception("Unhandled error serving CRM GET %s", self.path)
+            self._send_json(500, {"error": "internal server error"})
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
-        if "profile" in qs and qs["profile"]:
-            config.set_active_profile(qs["profile"][0])
+        with self._scoped_profile(self._requested_profile_from_query(qs)):
+            self._serve_get(parsed.path)
 
-        if parsed.path in ("/", "/index.html", "/dashboard"):
+    def _serve_get(self, path: str) -> None:
+        if path in ("/", "/index.html", "/dashboard"):
             conn = init_db()
             close_connection()
             html_path = Path(generate_dashboard(interactive_api=True))
@@ -126,11 +284,13 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
+            for header, value in self._cors_headers().items():
+                self.send_header(header, value)
             self.end_headers()
             self.wfile.write(raw)
             return
 
-        if parsed.path == "/api/jobs":
+        if path == "/api/jobs":
             conn = init_db()
             try:
                 stats = get_stats(conn)
@@ -149,7 +309,7 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
                 close_connection()
             return
 
-        if parsed.path in ("/api/export.csv", "/api/export"):
+        if path in ("/api/export.csv", "/api/export"):
             conn = init_db()
             try:
                 csv_str = export_jobs_csv_string(conn=conn)
@@ -160,6 +320,8 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", 'attachment; filename="applypilot_jobs.csv"')
             self.send_header("Content-Length", str(len(raw)))
+            for header, value in self._cors_headers().items():
+                self.send_header(header, value)
             self.end_headers()
             self.wfile.write(raw)
             return
@@ -211,6 +373,15 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
         return decoded if isinstance(decoded, dict) else {}
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._handle_post()
+        except _InvalidProfileError as exc:
+            self._send_json(400, {"error": str(exc)})
+        except Exception:  # noqa: BLE001 - never leak a traceback or a server path
+            log.exception("Unhandled error serving CRM POST %s", self.path)
+            self._send_json(500, {"error": "internal server error"})
+
+    def _handle_post(self) -> None:
         parsed = urlparse(self.path)
         try:
             payload = self._read_json_object_body()
@@ -221,7 +392,41 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": f"Request body exceeds {_MAX_REQUEST_BODY_BYTES} bytes"})
             return
 
-        if parsed.path == "/api/jobs/stage":
+        # A browser attaches Origin to every state-changing request, so a
+        # cross-site POST from any page the user has open is refused. Requests
+        # with no Origin (the CLI) are unaffected.
+        if self._origin_is_foreign():
+            log.warning("Refused cross-origin CRM POST %s from Origin: %s", parsed.path, self.headers.get("Origin"))
+            self._send_json(403, {"error": "cross-origin requests are not allowed"})
+            return
+
+        requested_profile = payload.get("profile")
+        if requested_profile is not None and not isinstance(requested_profile, str):
+            self._send_json(400, {"error": "profile must be a string when provided"})
+            return
+        with self._scoped_profile(requested_profile):
+            self._route_post(parsed.path, payload)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        """Answer CORS preflight, but only for a same-origin request."""
+        origin = self.headers.get("Origin")
+        if not origin or not self._origin_allowed(origin):
+            log.warning("Refused CORS preflight for %s from Origin: %s", self.path, origin)
+            self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _route_post(self, path: str, payload: dict[str, Any]) -> None:
+        if path == "/api/jobs/stage":
             url = str(payload.get("url") or "").strip()
             stage = str(payload.get("crm_stage") or "").strip()
             notes = payload.get("user_notes")
@@ -238,7 +443,7 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(exc)})
             return
 
-        if parsed.path == "/api/jobs/notes":
+        if path == "/api/jobs/notes":
             url = str(payload.get("url") or "").strip()
             notes = str(payload.get("user_notes") or "")
             if not url:
@@ -253,7 +458,7 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
                 close_connection()
             return
 
-        if parsed.path in ("/api/jobs/prep", "/api/jobs/outreach"):
+        if path in ("/api/jobs/prep", "/api/jobs/outreach"):
             target = str(payload.get("url") or payload.get("query") or "").strip()
             conn = init_db()
             try:
@@ -277,7 +482,7 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
                 close_connection()
             return
 
-        if parsed.path == "/api/jobs/proof":
+        if path == "/api/jobs/proof":
             from applypilot.apply.native_agent import build_application_payload
 
             target = str(payload.get("url") or payload.get("query") or "").strip()
@@ -293,7 +498,7 @@ class _CRMRequestHandler(BaseHTTPRequestHandler):
                 close_connection()
             return
 
-        if parsed.path == "/api/sync-email":
+        if path == "/api/sync-email":
             from applypilot.email_sync import sync_application_emails
 
             messages = payload.get("messages") if isinstance(payload.get("messages"), list) else None

@@ -37,14 +37,42 @@ _CACHE_MAXSIZE = 512
 _CACHE_MAX_BYTES = 8 * 1024 * 1024
 
 # Approximate USD cost per 1M tokens (input, output) for telemetry estimation.
+# Keys are matched as substrings of the requested model name, most specific first
+# is not required because names are matched in insertion order.
 _MODEL_COSTS_PER_1M: dict[str, tuple[float, float]] = {
     "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-2.0-flash-lite": (0.075, 0.30),
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-1.5-pro": (1.25, 5.00),
     "gpt-4o-mini": (0.15, 0.60),
-    "claude-3-5-haiku-latest": (0.80, 4.00),
-    "claude-3-7-sonnet-latest": (3.00, 15.00),
-    "llama-3.3-70b-versatile": (0.59, 0.79),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "o1": (15.00, 60.00),
+    "o1-mini": (1.10, 4.40),
+    "o3-mini": (1.10, 4.40),
+    "claude-3-haiku": (0.25, 1.25),
+    "claude-3-5-haiku": (0.80, 4.00),
+    "claude-3-5-sonnet": (3.00, 15.00),
+    "claude-3-7-sonnet": (3.00, 15.00),
+    "claude-sonnet-4": (3.00, 15.00),
+    "claude-opus-4": (15.00, 75.00),
+    "claude-3-opus": (15.00, 75.00),
+    "llama-3.3-70b": (0.59, 0.79),
+    "llama-3.1-70b": (0.59, 0.79),
+    "llama-3.1-8b": (0.05, 0.08),
+    "mixtral-8x7b": (0.24, 0.24),
+    "gemma-2-9b": (0.20, 0.20),
     "deepseek-chat": (0.14, 0.28),
+    "deepseek-reasoner": (0.55, 2.19),
 }
+
+# Operators can pin an unknown model's price so telemetry stays truthful:
+#   LLM_COST_PER_1M="my-finetune=3.00,15.00;some-other-model=1,4"
+_COST_OVERRIDE_ENV = "LLM_COST_PER_1M"
 
 _telemetry_lock = threading.Lock()
 _TELEMETRY: dict[str, float | int] = {
@@ -55,6 +83,9 @@ _TELEMETRY: dict[str, float | int] = {
     "failovers": 0,
     "cache_hits": 0,
     "total_latency_ms": 0,
+    # Calls whose model had no known price. Their cost contributes 0.0 rather than
+    # a guessed rate, so `estimated_cost_usd` is never silently wrong.
+    "unpriced_calls": 0,
 }
 _cache_lock = threading.Lock()
 _RESPONSE_CACHE: OrderedDict[str, tuple[str, int]] = OrderedDict()
@@ -97,6 +128,45 @@ def response_cache_info() -> dict[str, int]:
         }
 
 
+def _cost_override_table() -> dict[str, tuple[float, float]]:
+    """Parse `LLM_COST_PER_1M` into {model: (input, output)} rates."""
+    raw = os.environ.get(_COST_OVERRIDE_ENV, "").strip()
+    table: dict[str, tuple[float, float]] = {}
+    if not raw:
+        return table
+    for entry in raw.split(";"):
+        if "=" not in entry:
+            continue
+        name, _, rates = entry.partition("=")
+        parts = [part.strip() for part in rates.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            table[name.strip().lower()] = (float(parts[0]), float(parts[1]))
+        except ValueError:
+            log.warning("Ignoring malformed %s entry for model %r", _COST_OVERRIDE_ENV, name)
+    return table
+
+
+def _model_rates(model: str) -> tuple[float, float, bool]:
+    """Return (input_rate, output_rate, priced) for a model name per 1M tokens.
+
+    An unknown model prices at 0.0 and is reported as unpriced rather than being
+    billed at an unrelated model's rate.
+    """
+    lowered = (model or "").lower()
+    if "local" in lowered:
+        return (0.0, 0.0, True)
+    overrides = _cost_override_table()
+    for name, rates in overrides.items():
+        if name and name in lowered:
+            return (rates[0], rates[1], True)
+    for model_prefix, rates in _MODEL_COSTS_PER_1M.items():
+        if model_prefix in lowered:
+            return (rates[0], rates[1], True)
+    return (0.0, 0.0, False)
+
+
 def _record_telemetry(
     model: str,
     prompt_chars: int,
@@ -106,19 +176,15 @@ def _record_telemetry(
 ) -> None:
     prompt_toks = max(1, prompt_chars // 4)
     completion_toks = max(1, completion_chars // 4)
-    input_rate, output_rate = (0.15, 0.60)
-    for model_prefix, rates in _MODEL_COSTS_PER_1M.items():
-        if model_prefix in model.lower():
-            input_rate, output_rate = rates
-            break
-    if "local" in model.lower():
-        input_rate, output_rate = (0.0, 0.0)
+    input_rate, output_rate, priced = _model_rates(model)
     cost = (prompt_toks * input_rate + completion_toks * output_rate) / 1_000_000.0
     with _telemetry_lock:
         _TELEMETRY["calls"] = int(_TELEMETRY["calls"]) + 1
         _TELEMETRY["prompt_tokens_est"] = int(_TELEMETRY["prompt_tokens_est"]) + prompt_toks
         _TELEMETRY["completion_tokens_est"] = int(_TELEMETRY["completion_tokens_est"]) + completion_toks
         _TELEMETRY["estimated_cost_usd"] = round(float(_TELEMETRY["estimated_cost_usd"]) + cost, 6)
+        if not priced:
+            _TELEMETRY["unpriced_calls"] = int(_TELEMETRY["unpriced_calls"]) + 1
         if failover:
             _TELEMETRY["failovers"] = int(_TELEMETRY["failovers"]) + 1
         _TELEMETRY["total_latency_ms"] = int(_TELEMETRY["total_latency_ms"]) + latency_ms
@@ -129,8 +195,64 @@ def _record_cache_hit() -> None:
         _TELEMETRY["cache_hits"] = int(_TELEMETRY["cache_hits"]) + 1
 
 
+def _infer_model_family(model_name: str) -> str | None:
+    """Classify a model id by its vendor prefix, or None when it is unknown.
+
+    Unknown ids (custom/self-hosted names) return None so an explicit
+    `LLM_MODEL` override is still honoured for them.
+    """
+    name = model_name.strip().lower()
+    if not name:
+        return None
+    if name.startswith("claude"):
+        return "anthropic"
+    if name.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
+        return "openai"
+    if name.startswith("gemini"):
+        return "google"
+    if name.startswith(("llama", "mixtral", "gemma", "qwen", "kimi", "grok")):
+        return "groq"
+    if name.startswith("deepseek"):
+        return "deepseek"
+    return None
+
+
+def _provider_accepts_family(base_url: str, family: str | None) -> bool:
+    """Whether a hosted provider recognises model ids from ``family``.
+
+    An unknown family (a custom model name) is always accepted: the operator asked
+    for that model explicitly. A *known* family belonging to another vendor is
+    rejected so we never send a model name an endpoint will 404 on.
+    """
+    if family is None:
+        return True
+    if not base_url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+        return True
+    host = base_url.split("://", 1)[1].split("/", 1)[0]
+    if host.startswith("127.0.0.1") or host.startswith("localhost") or ".local" in host or ":11434" in base_url:
+        return True  # self-hosted endpoint, any model id is plausible
+    if "anthropic" in host:
+        return family == "anthropic"
+    if "openai.com" in host:
+        return family == "openai"
+    if "googleapis.com" in host:
+        return family == "google"
+    if "deepseek.com" in host:
+        return family == "deepseek"
+    if "openrouter.ai" in host:
+        return True  # aggregator: hosts other vendors' models
+    if "groq.com" in host:
+        return family == "groq"
+    return True  # unknown provider, do not second-guess the operator
+
+
 def _detect_all_providers() -> list[Provider]:
-    """Return configured providers in their deterministic failover order."""
+    """Return configured providers in their deterministic failover order.
+
+    `LLM_MODEL` overrides the model of the primary (first configured) endpoint and
+    is forwarded to a hosted provider only when that provider recognises the model
+    family, so one override can never 404 across an entire failover chain.
+    """
     model_override = os.environ.get("LLM_MODEL", "").strip()
     local_url = os.environ.get("LLM_URL", "").strip()
     providers: list[Provider] = []
@@ -148,9 +270,22 @@ def _detect_all_providers() -> list[Provider]:
     )
     for key_name, base_url, default_model in provider_specs:
         api_key = os.environ.get(key_name, "").strip()
-        if api_key:
-            model = model_override if model_override and not providers else default_model
-            providers.append((base_url, model, api_key))
+        if not api_key:
+            continue
+        model = default_model
+        if model_override and not providers:
+            family = _infer_model_family(model_override)
+            if _provider_accepts_family(base_url, family):
+                model = model_override
+            else:
+                log.warning(
+                    "Ignoring LLM_MODEL=%s for %s: this endpoint only serves its own model ids. "
+                    "Using %s instead.",
+                    model_override,
+                    base_url,
+                    default_model,
+                )
+        providers.append((base_url, model, api_key))
     return providers
 
 
@@ -548,10 +683,16 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         response_model: type[BaseModel] | None,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, int] | None:
+        """Return `(output, model, latency_ms)` from the first healthy fallback.
+
+        The latency is the fallback attempt's own duration, not the primary
+        attempt's, so failover telemetry never double-counts the failed call.
+        """
         for provider in self.fallbacks:
             base_url, model, _ = provider
             log.warning("LLM provider downgrade: switching to %s (%s)", base_url, model)
+            started = time.perf_counter()
             try:
                 output = self._request_sync(
                     provider,
@@ -561,7 +702,7 @@ class LLMClient:
                     response_model,
                     native_gemini=base_url.startswith(_GEMINI_COMPAT_BASE),
                 )
-                return output, model
+                return (output, model, int((time.perf_counter() - started) * 1000))
             except (httpx.HTTPError, ValueError, KeyError, _GeminiCompatForbidden) as exc:
                 log.warning("Fallback LLM provider %s failed: %s", model, exc)
         return None
@@ -573,10 +714,12 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         response_model: type[BaseModel] | None,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, int] | None:
+        """Async counterpart of `_try_fallbacks`, with its own latency measurement."""
         for provider in self.fallbacks:
             base_url, model, _ = provider
             log.warning("LLM provider downgrade: switching to %s (%s)", base_url, model)
+            started = time.perf_counter()
             try:
                 output = await self._request_async(
                     client,
@@ -587,7 +730,7 @@ class LLMClient:
                     response_model,
                     native_gemini=base_url.startswith(_GEMINI_COMPAT_BASE),
                 )
-                return output, model
+                return (output, model, int((time.perf_counter() - started) * 1000))
             except (httpx.HTTPError, ValueError, KeyError, _GeminiCompatForbidden) as exc:
                 log.warning("Fallback LLM provider %s failed: %s", model, exc)
         return None
@@ -634,9 +777,11 @@ class LLMClient:
                     response_model,
                     native_gemini=self._use_native_gemini,
                 )
-                _json_schema_response(output, response_model)
+                # Bill the call before validating: a response that burns tokens and
+                # then fails schema validation is still spend (structured_chat retries it).
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 _record_telemetry(self.model, prompt_chars, len(output), elapsed_ms)
+                _json_schema_response(output, response_model)
                 _cache_put(key, output)
                 return output
             except _GeminiCompatForbidden:
@@ -654,20 +799,21 @@ class LLMClient:
                         response_model,
                         native_gemini=True,
                     )
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    _record_telemetry(self.model, prompt_chars, len(output), elapsed_ms)
                     _json_schema_response(output, response_model)
-                    _record_telemetry(self.model, prompt_chars, len(output), int((time.perf_counter() - started) * 1000))
                     _cache_put(key, output)
                     return output
-                except (httpx.HTTPError, ValueError, KeyError) as native_exc:
+                except (httpx.HTTPError, ValueError, KeyError, _GeminiCompatForbidden) as native_exc:
                     log.warning("Gemini native endpoint failed: %s", native_exc)
                     fallback = self._try_fallbacks(request_messages, temperature, max_tokens, response_model)
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _json_schema_response(output, response_model)
@@ -679,13 +825,13 @@ class LLMClient:
                 if response.status_code in _TRANSIENT_STATUS_CODES and self.fallbacks:
                     fallback = self._try_fallbacks(request_messages, temperature, max_tokens, response_model)
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _json_schema_response(output, response_model)
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _cache_put(key, output)
@@ -705,13 +851,13 @@ class LLMClient:
                 if self.fallbacks:
                     fallback = self._try_fallbacks(request_messages, temperature, max_tokens, response_model)
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _json_schema_response(output, response_model)
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _cache_put(key, output)
@@ -720,6 +866,32 @@ class LLMClient:
                     raise
                 wait = retry_policy.delay(attempt)
                 log.warning("LLM transport failure (%s); retrying in %.2fs.", type(exc).__name__, wait)
+                time.sleep(wait)
+            except (ValueError, json.JSONDecodeError) as exc:
+                # Response parsing produced no usable completion ("no completion
+                # choices", "empty or non-text completion", undecodable JSON).
+                # These are transient from the caller's perspective, so a configured
+                # fallback runs first and only then an in-place retry.
+                if isinstance(exc, ValidationError):
+                    raise  # schema mismatch: structured_chat re-prompts with the errors
+                if self.fallbacks:
+                    fallback = self._try_fallbacks(request_messages, temperature, max_tokens, response_model)
+                    if fallback is not None:
+                        output, fallback_model, fallback_ms = fallback
+                        _json_schema_response(output, response_model)
+                        _record_telemetry(
+                            fallback_model,
+                            prompt_chars,
+                            len(output),
+                            fallback_ms,
+                            failover=True,
+                        )
+                        _cache_put(key, output)
+                        return output
+                if attempt + 1 >= _MAX_RETRIES:
+                    raise
+                wait = retry_policy.delay(attempt)
+                log.warning("LLM unusable response (%s); retrying in %.2fs.", exc, wait)
                 time.sleep(wait)
 
         raise RuntimeError("LLM request failed after all retries")
@@ -791,8 +963,9 @@ class LLMClient:
                     response_model,
                     native_gemini=self._use_native_gemini,
                 )
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                _record_telemetry(self.model, prompt_chars, len(output), elapsed_ms)
                 _json_schema_response(output, response_model)
-                _record_telemetry(self.model, prompt_chars, len(output), int((time.perf_counter() - started) * 1000))
                 _cache_put(key, output)
                 return output
             except _GeminiCompatForbidden:
@@ -811,23 +984,24 @@ class LLMClient:
                         response_model,
                         native_gemini=True,
                     )
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    _record_telemetry(self.model, prompt_chars, len(output), elapsed_ms)
                     _json_schema_response(output, response_model)
-                    _record_telemetry(self.model, prompt_chars, len(output), int((time.perf_counter() - started) * 1000))
                     _cache_put(key, output)
                     return output
-                except (httpx.HTTPError, ValueError, KeyError) as native_exc:
+                except (httpx.HTTPError, ValueError, KeyError, _GeminiCompatForbidden) as native_exc:
                     log.warning("Gemini native endpoint failed: %s", native_exc)
                     fallback = await self._try_fallbacks_async(
                         client, request_messages, temperature, max_tokens, response_model
                     )
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _json_schema_response(output, response_model)
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _cache_put(key, output)
@@ -840,13 +1014,13 @@ class LLMClient:
                         client, request_messages, temperature, max_tokens, response_model
                     )
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _json_schema_response(output, response_model)
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _cache_put(key, output)
@@ -862,13 +1036,13 @@ class LLMClient:
                         client, request_messages, temperature, max_tokens, response_model
                     )
                     if fallback is not None:
-                        output, fallback_model = fallback
+                        output, fallback_model, fallback_ms = fallback
                         _json_schema_response(output, response_model)
                         _record_telemetry(
                             fallback_model,
                             prompt_chars,
                             len(output),
-                            int((time.perf_counter() - started) * 1000),
+                            fallback_ms,
                             failover=True,
                         )
                         _cache_put(key, output)
@@ -877,6 +1051,32 @@ class LLMClient:
                     raise
                 wait = retry_policy.delay(attempt)
                 log.warning("LLM async transport failure (%s); retrying in %.2fs.", type(exc).__name__, wait)
+                await asyncio.sleep(wait)
+            except (ValueError, json.JSONDecodeError) as exc:
+                # See the sync path: unusable responses are transient, but a schema
+                # mismatch belongs to astructured_chat's corrective retry.
+                if isinstance(exc, ValidationError):
+                    raise
+                if self.fallbacks:
+                    fallback = await self._try_fallbacks_async(
+                        client, request_messages, temperature, max_tokens, response_model
+                    )
+                    if fallback is not None:
+                        output, fallback_model, fallback_ms = fallback
+                        _json_schema_response(output, response_model)
+                        _record_telemetry(
+                            fallback_model,
+                            prompt_chars,
+                            len(output),
+                            fallback_ms,
+                            failover=True,
+                        )
+                        _cache_put(key, output)
+                        return output
+                if attempt + 1 >= _MAX_RETRIES:
+                    raise
+                wait = retry_policy.delay(attempt)
+                log.warning("LLM unusable async response (%s); retrying in %.2fs.", exc, wait)
                 await asyncio.sleep(wait)
 
         raise RuntimeError("LLM request failed after all retries")

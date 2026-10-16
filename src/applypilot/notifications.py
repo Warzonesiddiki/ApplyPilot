@@ -38,8 +38,24 @@ def has_notification_channel() -> bool:
     return has_webhook or has_tg
 
 
+def _record_delivery_error(channel: str, exc: BaseException) -> str:
+    """Return a credential-free error string for a failed delivery.
+
+    The raw exception text is never returned or logged: `httpx` embeds the full
+    request URL in its message, and for Telegram (`/bot<TOKEN>/sendMessage`) or a
+    webhook (`WEBHOOK_URL`) that URL *is* the credential. Only the exception type
+    reaches the debug log.
+    """
+    log.debug("Notification delivery to %s failed (%s)", channel, type(exc).__name__)
+    return f"{channel}: delivery failed ({type(exc).__name__})"
+
+
 def send_notification(message: str, title: str = "ApplyPilot Update") -> NotificationResult:
-    """Dispatch a notification message to configured Webhook and/or Telegram channels."""
+    """Dispatch a notification message to configured Webhook and/or Telegram channels.
+
+    Returned errors are deliberately generic: these strings reach console output and
+    logs, so they must never carry the webhook URL or the Telegram bot token.
+    """
     config.load_env()
     webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -56,8 +72,7 @@ def send_notification(message: str, title: str = "ApplyPilot Update") -> Notific
                 resp.raise_for_status()
             sent_channels.append("webhook")
         except Exception as exc:
-            log.debug("Webhook notification error: %s", exc)
-            errors.append(f"webhook: {exc}")
+            errors.append(_record_delivery_error("webhook", exc))
 
     if tg_token and tg_chat:
         try:
@@ -68,8 +83,7 @@ def send_notification(message: str, title: str = "ApplyPilot Update") -> Notific
                 resp.raise_for_status()
             sent_channels.append("telegram")
         except Exception as exc:
-            log.debug("Telegram notification error: %s", exc)
-            errors.append(f"telegram: {exc}")
+            errors.append(_record_delivery_error("telegram", exc))
 
     return {"sent": sent_channels, "errors": errors}
 

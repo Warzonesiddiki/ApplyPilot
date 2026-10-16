@@ -30,6 +30,27 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
+# Statuses whose resume may be persisted as `tailored_resume_path` and therefore
+# submitted by the apply pipeline. `approved_with_judge_warning` is deliberately
+# absent: it only occurs when a caller opts into `accept_judge_warning`.
+SUCCESS_STATUSES: frozenset[str] = frozenset({"approved"})
+
+# Every status a tailoring run can produce is normalised into exactly one bucket so
+# the reported totals always account for every artefact written to TAILORED_DIR.
+_STATUS_BUCKETS: tuple[str, ...] = ("approved", "failed_validation", "failed_judge", "failed_other", "error")
+
+
+def _status_bucket(status: str | None) -> str:
+    """Map a tailoring report status onto its accounting bucket."""
+    name = (status or "error").strip().lower()
+    if name in ("approved", "approved_with_judge_warning"):
+        return "approved"
+    if name in ("failed_validation", "failed_judge"):
+        return name
+    if name == "error":
+        return "error"
+    return "failed_other"
+
 
 # ── Prompt Builders (profile-driven & domain-adaptive) ────────────────────
 
@@ -200,6 +221,8 @@ The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 m
 - Adding any LEARNABLE skill given their existing stack/qualification is a MINOR STRETCH.
 - Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
 
+NUMBERS ARE NEVER A MINOR STRETCH: any figure, percentage or currency amount that is not present in the original resume or the real metrics list above is a MAJOR lie. FAIL it.
+
 Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
 
 
@@ -336,8 +359,16 @@ def judge_tailored_resume(
 def tailor_resume(
     resume_text: str, job: dict[str, Any], profile: dict[str, Any],
     max_retries: int = 3, validation_mode: str = "normal",
+    accept_judge_warning: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    """Generate a tailored resume via JSON output + fresh context on each retry."""
+    """Generate a tailored resume via JSON output + fresh context on each retry.
+
+    A `FAIL` verdict from the anti-fabrication judge is a hard failure: the report
+    status becomes ``failed_judge`` and the caller must not persist an output path
+    for it, because `launcher.acquire_job` would then upload and submit a resume
+    the judge rejected. `accept_judge_warning` is an explicit, opt-in escape hatch
+    that restores the old `approved_with_judge_warning` behaviour.
+    """
     from applypilot.scoring.ats import compute_ats_coverage
 
     company_name = job.get("company") or job.get("site") or "Unknown"
@@ -392,7 +423,9 @@ def tailor_resume(
         data = structured.model_dump()
 
         # Layer 1: Validate JSON fields
-        validation = validate_json_fields(data, profile, mode=validation_mode)
+        validation = validate_json_fields(
+            data, profile, mode=validation_mode, original_text=resume_text
+        )
         report["validator"] = validation
 
         if not validation["passed"]:
@@ -419,7 +452,11 @@ def tailor_resume(
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
             if attempt < max_retries and validation_mode != "lenient":
                 continue
-            report["status"] = "approved_with_judge_warning"
+            # The judge exists to stop fabricated resumes being submitted. Downgrading
+            # FAIL to "approved" defeats it, so rejection is the default outcome.
+            report["status"] = (
+                "approved_with_judge_warning" if accept_judge_warning else "failed_judge"
+            )
             return tailored, report
 
         report["status"] = "approved"
@@ -463,7 +500,7 @@ def run_tailoring(
     log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
     t0 = time.time()
     results: list[dict[str, Any]] = []
-    stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
+    stats: dict[str, int] = dict.fromkeys(_STATUS_BUCKETS, 0)
 
     for completed, job in enumerate(jobs, 1):
         try:
@@ -510,7 +547,7 @@ def run_tailoring(
             # Generate PDF and DOCX for approved resumes (best-effort)
             pdf_path = None
             docx_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if report["status"] in SUCCESS_STATUSES:
                 try:
                     from applypilot.scoring.docx_export import convert_to_docx
                     docx_path = str(convert_to_docx(txt_path, profile=profile))
@@ -522,9 +559,14 @@ def run_tailoring(
                 except Exception:
                     log.debug("PDF generation failed for %s", txt_path, exc_info=True)
 
+            # `path` is the value persisted as `tailored_resume_path`, which is what
+            # `launcher.acquire_job` gates on. It stays NULL for anything not approved
+            # so a rejected resume can never be uploaded and submitted.
+            approved = report["status"] in SUCCESS_STATUSES
             result = {
                 "url": job["url"],
-                "path": str(txt_path),
+                "path": str(txt_path) if approved else None,
+                "artefact_path": str(txt_path),
                 "pdf_path": pdf_path,
                 "docx_path": docx_path,
                 "ats_coverage_pct": ats_cov["coverage_pct"],
@@ -536,13 +578,14 @@ def run_tailoring(
         except Exception as e:
             result = {
                 "url": job["url"], "title": job.get("title", ""), "site": job.get("site", ""),
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None, "docx_path": None,
+                "status": "error", "attempts": 0, "path": None, "artefact_path": None,
+                "pdf_path": None, "docx_path": None,
                 "ats_coverage_pct": None,
             }
             log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), (job.get("title") or "")[:40], e)
 
         results.append(result)
-        stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+        stats[_status_bucket(result.get("status"))] += 1
 
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
@@ -559,9 +602,8 @@ def run_tailoring(
     from applypilot.database import ensure_columns
     ensure_columns(conn)
     now = datetime.now(UTC).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
-        if r["status"] in _success_statuses:
+        if _status_bucket(r["status"]) == "approved" and r.get("path"):
             pdf_gen_at = now if r.get("pdf_path") else None
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, pdf_generated_at=?, "
@@ -578,18 +620,26 @@ def run_tailoring(
     conn.commit()
 
     elapsed = time.time() - t0
+    failed_total = (
+        stats["failed_validation"] + stats["failed_judge"] + stats["failed_other"]
+    )
+    accounted = stats["approved"] + failed_total + stats["error"]
+    if accounted != len(results):  # pragma: no cover - guards future status additions
+        log.error("Tailoring accounting mismatch: %d counted vs %d results", accounted, len(results))
     log.info(
-        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, %d errors",
+        "Tailoring done in %.1fs: %d approved, %d failed_validation, %d failed_judge, "
+        "%d failed_other, %d errors",
         elapsed,
-        stats.get("approved", 0),
-        stats.get("failed_validation", 0),
-        stats.get("failed_judge", 0),
-        stats.get("error", 0),
+        stats["approved"],
+        stats["failed_validation"],
+        stats["failed_judge"],
+        stats["failed_other"],
+        stats["error"],
     )
 
     return {
-        "approved": stats.get("approved", 0),
-        "failed": stats.get("failed_validation", 0) + stats.get("failed_judge", 0),
-        "errors": stats.get("error", 0),
+        "approved": stats["approved"],
+        "failed": failed_total,
+        "errors": stats["error"],
         "elapsed": elapsed,
     }

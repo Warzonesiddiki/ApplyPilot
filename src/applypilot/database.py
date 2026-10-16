@@ -8,74 +8,50 @@ without migration ordering issues.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sqlite3
-import sys
 import threading
-import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, cast
+from typing import Any
 
 from applypilot import config
 
 log = logging.getLogger(__name__)
 
-# Advisory writer-lock primitives are platform-specific. We import them at
-# module level behind explicit platform guards so static analyzers see real
-# attribute bindings instead of Unix-only names on Windows builds.
-
-if sys.platform == "win32":
-    _FCNTL: Any = None
-    _HAS_FCNTL = False
-else:
-    import fcntl as _fcntl_mod
-
-    _FCNTL = _fcntl_mod
-    _HAS_FCNTL = True
-
 # Thread-local connection storage — each thread gets its own connection.
 _local = threading.local()
 _SQLITE_BUSY_TIMEOUT_MS = 30_000
-_SQLITE_LOCK_TIMEOUT_SECONDS = 30.0
+# Bumped whenever a migration changes something ALTER TABLE cannot express
+# (column type changes, renames, index-only changes, backfills). Databases
+# stamped with a lower version are walked through _apply_migrations().
+SCHEMA_VERSION = 2
 # Safety cap applied when get_jobs_by_stage is asked for an "unlimited" batch
 # (limit <= 0). Rows carry full descriptions, so an unbounded SELECT * could
 # materialize the whole table; 1000 rows is 10x the largest stage default.
 _MAX_UNLIMITED_STAGE_ROWS = 1000
+# Jobs inserted before a commit is issued, so a large discovery batch does not
+# hold SQLite's single write lock (and therefore every other writer) hostage.
+_STORE_COMMIT_BATCH = 200
 JobRecord = dict[str, Any]
 DatabaseStats = dict[str, Any]
 
 
-class _MsvcrtLocking(Protocol):
-    """Subset of the Windows ``msvcrt`` API used for writer locking."""
-
-    LK_NBLCK: int
-    LK_UNLCK: int
-
-    def locking(self, fd: int, mode: int, nbytes: int) -> None: ...
+# PRAGMAs that mutate the database file/header and therefore need the write lock.
+_WRITE_PRAGMAS = frozenset({"user_version", "schema_version", "application_id"})
 
 
-def _get_msvcrt_locking() -> _MsvcrtLocking:
-    """Import the Windows-only locking API behind a portable type contract."""
-    import msvcrt
+class _WriteSerializedConnection(sqlite3.Connection):
+    """SQLite connection that opens every write transaction with ``BEGIN IMMEDIATE``.
 
-    return cast(_MsvcrtLocking, msvcrt)
-
-
-class _SerializedSQLiteConnection(sqlite3.Connection):
-    """SQLite connection that serializes write transactions across processes.
-
-    SQLite remains responsible for its own database-level locking. This
-    advisory lock gives writers a consistent acquisition order across ApplyPilot
-    workers and separate processes, while `busy_timeout` remains a final guard
-    for other SQLite clients that do not use the lock file.
+    SQLite remains responsible for its own database-level locking. Taking the
+    RESERVED write lock up front means concurrent ApplyPilot workers — threads
+    *and* separate processes — queue on SQLite's own ``busy_timeout`` instead of
+    deadlocking on an out-of-band advisory lock file. (A POSIX ``flock`` treats
+    two descriptors inside one process as conflicting, so the previous
+    file-based lock made ``--workers 4`` serialise, and it leaked whenever a
+    caller raised between a write and its commit.)
     """
-
-    def __init__(self, database: str | bytes, *args: Any, **kwargs: Any) -> None:
-        self._database_path = os.fsdecode(database)
-        self._writer_lock_handle: BinaryIO | None = None
-        super().__init__(database, *args, **kwargs)
 
     @staticmethod
     def _is_read_only(statement: str) -> bool:
@@ -92,118 +68,96 @@ class _SerializedSQLiteConnection(sqlite3.Connection):
                     return False
             sql = sql.lstrip()
         verb = sql.split(None, 1)[0].upper() if sql else ""
-        return verb in {"SELECT", "EXPLAIN", "PRAGMA", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+        if verb == "PRAGMA":
+            # `PRAGMA <name>` reads; only header-writing pragmas mutate state.
+            parts = sql.replace("=", " ").split()
+            name = parts[1].lower() if len(parts) > 1 else ""
+            return name not in _WRITE_PRAGMAS
+        return verb in {"SELECT", "EXPLAIN", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE"}
 
-    def _acquire_writer_lock(self) -> None:
-        """Acquire a portable advisory lock, with a bounded wait."""
-        if self._writer_lock_handle is not None:
+    def _begin_write_transaction(self) -> None:
+        """Acquire SQLite's write lock before the first mutating statement."""
+        if self.in_transaction:
             return
-
-        lock_path = Path(f"{self._database_path}.writer.lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
-        if os.name == "nt":
-            msvcrt = _get_msvcrt_locking()
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-        else:
-            if not _HAS_FCNTL:
-                raise RuntimeError("Database writer locking is only supported on POSIX")
-
-        deadline = time.monotonic() + _SQLITE_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                if os.name == "nt":
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
-                self._writer_lock_handle = handle
-                return
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    handle.close()
-                    raise sqlite3.OperationalError(
-                        f"Timed out waiting for the SQLite writer lock for {self._database_path}"
-                    ) from exc
-                time.sleep(0.05)
-
-    def _release_writer_lock(self) -> None:
-        handle = self._writer_lock_handle
-        if handle is None:
-            return
-        self._writer_lock_handle = None
-        try:
-            if os.name == "nt":
-                msvcrt = _get_msvcrt_locking()
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                if not _HAS_FCNTL:
-                    raise RuntimeError("Database writer lock release is only supported on POSIX")
-
-                _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_UN)
-        finally:
-            handle.close()
+        super().execute("BEGIN IMMEDIATE")
 
     def execute(self, sql: str, parameters: Any = (), /) -> sqlite3.Cursor:
         if not self._is_read_only(sql):
-            self._acquire_writer_lock()
-        try:
-            return super().execute(sql, parameters)
-        except BaseException:
-            if not self.in_transaction:
-                self._release_writer_lock()
-            raise
+            self._begin_write_transaction()
+        return super().execute(sql, parameters)
 
     def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
         if not self._is_read_only(sql):
-            self._acquire_writer_lock()
-        try:
-            return super().executemany(sql, parameters)
-        except BaseException:
-            if not self.in_transaction:
-                self._release_writer_lock()
-            raise
+            self._begin_write_transaction()
+        return super().executemany(sql, parameters)
 
-    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
-        self._acquire_writer_lock()
-        try:
-            return super().executescript(sql_script)
-        except BaseException:
-            if not self.in_transaction:
-                self._release_writer_lock()
-            raise
+    def writer_lock(self) -> "_WriterLock":
+        """Return an RAII guard that commits/rolls back and releases the write lock."""
+        return _WriterLock(self)
 
-    def commit(self) -> None:
-        try:
-            super().commit()
-        finally:
-            self._release_writer_lock()
 
-    def rollback(self) -> None:
-        try:
-            super().rollback()
-        finally:
-            self._release_writer_lock()
+class _WriterLock:
+    """Context manager that always ends an open write transaction.
 
-    def close(self) -> None:
+    Guarantees the write lock is handed back even when the guarded block raises
+    between a write and its commit, which is what previously wedged every
+    subsequent writer until it timed out.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> sqlite3.Connection:
+        return self._conn
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         try:
-            super().close()
-        finally:
-            self._release_writer_lock()
+            if self._conn.in_transaction:
+                if exc_type is None:
+                    self._conn.commit()
+                else:
+                    self._conn.rollback()
+        except sqlite3.Error as exc:
+            log.warning("Could not close the write transaction cleanly: %s", exc)
+
+
+def _close_quietly(conn: sqlite3.Connection) -> None:
+    """Close a connection, ignoring errors from an already-broken handle."""
+    try:
+        conn.close()
+    except sqlite3.Error as exc:  # pragma: no cover - defensive
+        log.debug("Ignoring error while closing connection: %s", exc)
+
+
+def _open_connection(path: str) -> sqlite3.Connection:
+    """Open a fresh connection with ApplyPilot's PRAGMA baseline."""
+    conn = sqlite3.connect(
+        path,
+        timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+        factory=_WriteSerializedConnection,
+    )
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA cache_size=-64000")
+    except BaseException:
+        # Never leak the file descriptor (and the open write transaction) when
+        # a PRAGMA fails on a fresh handle.
+        _close_quietly(conn)
+        raise
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     """Get a thread-local SQLite connection configured for concurrent workers.
 
     Every new connection enables WAL, NORMAL synchronous mode, a 30-second
-    busy timeout, and a 64 MiB page cache. Write transactions use a portable
-    advisory lock in addition to SQLite's native locking.
+    busy timeout, and a 64 MiB page cache. Write transactions take SQLite's
+    write lock up front (``BEGIN IMMEDIATE``) so writers queue instead of
+    colliding.
     """
     path = str(Path(db_path or config.DB_PATH).expanduser().resolve())
     connections: dict[str, sqlite3.Connection] = getattr(_local, "connections", {})
@@ -217,18 +171,10 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
             return conn
         except sqlite3.ProgrammingError:
             connections.pop(path, None)
+            _close_quietly(conn)
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(
-        path,
-        timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000,
-        factory=_SerializedSQLiteConnection,
-    )
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
-    conn.execute("PRAGMA cache_size=-64000")
-    conn.row_factory = sqlite3.Row
+    conn = _open_connection(path)
     connections[path] = conn
     return conn
 
@@ -239,7 +185,7 @@ def close_connection(db_path: Path | str | None = None) -> None:
     connections: dict[str, sqlite3.Connection] = getattr(_local, "connections", {})
     conn = connections.pop(path, None)
     if conn is not None:
-        conn.close()
+        _close_quietly(conn)
 
 
 def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:

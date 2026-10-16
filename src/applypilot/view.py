@@ -15,26 +15,52 @@ from __future__ import annotations
 
 from html import escape
 import json
+import logging
 from pathlib import Path
+import re
+import sqlite3
 import webbrowser
 
 from rich.console import Console
 
 from applypilot import config
-from applypilot.database import ensure_columns, get_connection, get_stats
+from applypilot.database import close_connection, get_stats, init_db
 
 console = Console()
+log = logging.getLogger(__name__)
 
 
 def _read_optional_file(path_str: str | None) -> str:
+    """Read an optional generated document, returning "" when it is not present.
+
+    Failures are logged at debug level rather than silently swallowed so a
+    permissions error stays distinguishable from "never generated".
+    """
     if not path_str:
         return ""
     try:
         p = Path(path_str)
         if p.exists():
             return p.read_text(encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:  # a single unreadable document must not kill the render
+        log.debug("Could not read optional dashboard document %s: %s", path_str, exc)
+    return ""
+
+
+def _safe_href(url: str) -> str:
+    """Return an HTML-escaped href for `url`, or "" when the scheme is unsafe.
+
+    Job rows come from scraped boards and are attacker-influenced. Escaping
+    alone does not help for an attribute that the browser *resolves* as a URL,
+    so a `javascript:` / `data:` posting URL is dropped rather than rendered.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    # Browsers ignore control characters and whitespace when resolving a scheme.
+    probe = re.sub(r"[\x00-\x20]+", "", candidate).lower()
+    if probe.startswith(("http://", "https://", "/", "#")):
+        return escape(candidate)
     return ""
 
 
@@ -50,8 +76,23 @@ def generate_dashboard(output_path: str | None = None, interactive_api: bool = F
     """
     out = Path(output_path) if output_path else config.APP_DIR / "dashboard.html"
 
-    conn = get_connection()
-    ensure_columns(conn)
+    # init_db() rather than get_connection(): on a brand-new workspace the
+    # schema does not exist yet and `applypilot dashboard` used to die with
+    # "no such table: jobs". init_db() is idempotent, so this also migrates.
+    conn = init_db()
+    try:
+        return _render_dashboard(conn, out, interactive_api)
+    finally:
+        # The connection used to stay open for the lifetime of the process.
+        close_connection()
+
+
+def _render_dashboard(conn: sqlite3.Connection, out: Path, interactive_api: bool) -> str:
+    """Render the dashboard HTML for an open `conn` into `out`.
+
+    Split out of :func:`generate_dashboard` so the connection has a single,
+    unambiguous owner and every exit path closes it.
+    """
     stats = get_stats(conn)
 
     total = stats.get("total", 0)
@@ -336,7 +377,12 @@ function filterText(text) {
   applyFilters();
 }
 
-async function updateJobStage(url, crm_stage) {
+function jobUrl(el) {
+  return (el && el.dataset && el.dataset.url) ? el.dataset.url : '';
+}
+
+async function updateJobStage(el, crm_stage) {
+  const url = jobUrl(el);
   try {
     const res = await fetch('/api/jobs/stage', {
       method: 'POST',
@@ -352,7 +398,9 @@ async function updateJobStage(url, crm_stage) {
   } catch (e) { console.error(e); }
 }
 
-async function saveJobNote(url, user_notes) {
+async function saveJobNote(el) {
+  const url = jobUrl(el);
+  const user_notes = el.value;
   try {
     await fetch('/api/jobs/notes', {
       method: 'POST',
@@ -362,7 +410,8 @@ async function saveJobNote(url, user_notes) {
   } catch (e) { console.error(e); }
 }
 
-async function generateProofPacket(url, btn) {
+async function generateProofPacket(btn) {
+  const url = jobUrl(btn);
   const orig = btn.textContent;
   btn.textContent = 'Building...';
   btn.disabled = true;
@@ -436,7 +485,8 @@ function toggleKanbanView() {
   }
 }
 
-async function generatePrepAndOutreach(url, btn) {
+async function generatePrepAndOutreach(btn) {
+  const url = jobUrl(btn);
   const orig = btn.textContent;
   btn.textContent = 'Generating...';
   btn.disabled = true;
@@ -508,184 +558,199 @@ applyFilters();
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = out.with_name(out.name + ".tmp")
 
-    handle = tmp_out.open("w", encoding="utf-8")
-    handle.write(html_head)
-    current_score = None
-    for j in jobs:
-        score = j["fit_score"] if j["fit_score"] is not None else 0
-        if score != current_score:
+    try:
+        with tmp_out.open("w", encoding="utf-8") as handle:
+            handle.write(html_head)
+            current_score = None
+            for j in jobs:
+                score = j["fit_score"] if j["fit_score"] is not None else 0
+                if score != current_score:
+                    if current_score is not None:
+                        handle.write("</div>")
+                    score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#64748b")
+                    score_label = {
+                        10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
+                        7: "Good Fit", 6: "Moderate+", 5: "Moderate", 0: "Unscored / Discovered",
+                    }.get(score, f"Score {score}")
+                    count_at_score = score_dist.get(score, 0) if score > 0 else (total - scored)
+                    handle.write(f"""
+                    <h2 class="score-header" style="border-color:{score_color}">
+                      <span class="score-badge" style="background:{score_color}">{score if score > 0 else '–'}</span>
+                      {score_label} ({count_at_score} jobs)
+                    </h2>
+                    <div class="job-grid">""")
+                    current_score = score
+
+                title = escape(j["title"] or "Untitled")
+                company = escape(j["company"] or j["site"] or "Employer")
+                raw_url = j["url"] or ""
+                url = escape(raw_url)
+                title_href = _safe_href(raw_url)
+                salary = escape(j["salary"] or "")
+                location = escape(j["location"] or "")
+                site = escape(j["site"] or "")
+                site_color = colors.get(j["site"] or "", "#60a5fa")
+                apply_url = _safe_href(j["application_url"] or raw_url)
+                sponsor_status = j["sponsor_status"] or "unknown"
+                work_arr = j["work_arrangement"] or "onsite"
+                crm_stage = j["crm_stage"] or "discovered"
+                ats_pct = j["ats_coverage_pct"]
+
+                reasoning_raw = j["score_reasoning"] or ""
+                reasoning_lines = reasoning_raw.split("\n")
+                keywords = reasoning_lines[0][:140] if reasoning_lines else ""
+                reasoning = reasoning_lines[1][:240] if len(reasoning_lines) > 1 else ""
+
+                sub_pills_html = ""
+                if j["score_breakdown"]:
+                    try:
+                        bd = json.loads(j["score_breakdown"])
+                        sub_pills_html = (
+                            f'<div class="subscore-row">'
+                            f'<span class="sub-pill">Skills: {bd.get("skills_score", "-")}</span>'
+                            f'<span class="sub-pill">Quals: {bd.get("qualifications_score", "-")}</span>'
+                            f'<span class="sub-pill">Domain: {bd.get("domain_score", "-")}</span>'
+                            f'<span class="sub-pill">Loc/Visa: {bd.get("location_score", "-")}</span>'
+                            f"</div>"
+                        )
+                    except Exception:
+                        pass
+
+                meta_parts = [
+                    f'<span class="meta-tag company-tag">{company}</span>',
+                    f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>',
+                ]
+                if salary:
+                    meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
+                if location:
+                    meta_parts.append(f'<span class="meta-tag location">{location[:42]}</span>')
+                if ats_pct is not None:
+                    meta_parts.append(f'<span class="meta-tag ats-tag">ATS: {ats_pct}%</span>')
+                if sponsor_status == "sponsorship_offered":
+                    meta_parts.append('<span class="meta-tag sponsor-yes">★ Visa Sponsorship Offered</span>')
+                elif sponsor_status == "licensed_sponsor":
+                    meta_parts.append('<span class="meta-tag sponsor-lic">✓ Licensed UK/EU Sponsor</span>')
+                elif sponsor_status == "no_sponsorship_stated":
+                    meta_parts.append('<span class="meta-tag sponsor-no">⚠ No Sponsorship Stated</span>')
+                meta_parts.append(f'<span class="meta-tag arr-tag">{escape(work_arr.title())}</span>')
+                meta_parts.append(f'<span class="meta-tag stage-tag">{escape(crm_stage.upper())}</span>')
+                meta_html = " ".join(meta_parts)
+
+                full_text = j["full_description"] or j["description"] or ""
+                desc_preview = escape(full_text)[:280]
+                full_desc_html = escape(full_text).replace("\n", "<br>")
+                desc_len = len(full_text)
+
+                tailored_txt = _read_optional_file(j["tailored_resume_path"])
+                cover_txt = _read_optional_file(j["cover_letter_path"])
+                prep_txt = _read_optional_file(j["prep_pack_path"])
+                outreach_txt = _read_optional_file(j["outreach_path"])
+
+                drawers_html = ""
+                if full_text:
+                    drawers_html += (
+                        f"<details class='full-desc-details'><summary class='expand-btn'>"
+                        f"Full Description ({desc_len:,} chars)</summary>"
+                        f"<div class='full-desc'>{full_desc_html}</div></details>"
+                    )
+                if tailored_txt:
+                    drawers_html += (
+                        f"<details class='full-desc-details'><summary class='expand-btn'>"
+                        f"Tailored CV Preview</summary>"
+                        f"<div class='full-desc'>{escape(tailored_txt)}</div></details>"
+                    )
+                    if base_resume_txt:
+                        drawers_html += (
+                            f"<details class='full-desc-details'><summary class='expand-btn'>"
+                            f"Base vs. Tailored CV Side-by-Side Diff</summary>"
+                            f"<div class='diff-grid'>"
+                            f"<div class='full-desc'><strong>Base CV</strong>\n\n{escape(base_resume_txt)}</div>"
+                            f"<div class='full-desc'><strong>Tailored CV (ATS: {ats_pct if ats_pct is not None else '-'}%)</strong>\n\n{escape(tailored_txt)}</div>"
+                            f"</div></details>"
+                        )
+                if cover_txt:
+                    drawers_html += (
+                        f"<details class='full-desc-details'><summary class='expand-btn'>"
+                        f"Cover Letter Preview</summary>"
+                        f"<div class='full-desc'>{escape(cover_txt)}</div></details>"
+                    )
+                if prep_txt:
+                    drawers_html += (
+                        f"<details class='full-desc-details'><summary class='expand-btn'>"
+                        f"Interview Prep Dossier</summary>"
+                        f"<div class='full-desc'>{escape(prep_txt)}</div></details>"
+                    )
+                if outreach_txt:
+                    drawers_html += (
+                        f"<details class='full-desc-details'><summary class='expand-btn'>"
+                        f"LinkedIn & Cold Email Outreach</summary>"
+                        f"<div class='full-desc'>{escape(outreach_txt)}</div></details>"
+                    )
+
+                user_notes_txt = escape(j["user_notes"] or "")
+                notes_html = f'<div class="notes-box">📝 {user_notes_txt}</div>' if user_notes_txt else ""
+                if interactive_api:
+                    notes_html += (
+                        f'<div class="notes-edit-row">'
+                        f'<input type="text" class="search-input notes-input" placeholder="Add CRM note / follow-up..." '
+                        f'value="{user_notes_txt}" data-url="{url}" onchange="saveJobNote(this)">'
+                        f'</div>'
+                    )
+
+                crm_controls_html = ""
+                if interactive_api:
+                    stages_list = [
+                        "discovered", "enriched", "scored", "tailored",
+                        "ready_to_apply", "applied", "assessment", "interviewing", "offer", "rejected", "archived",
+                    ]
+                    opts = "".join(
+                        f'<option value="{st}" {"selected" if st == crm_stage else ""}>{st.upper()}</option>'
+                        for st in stages_list
+                    )
+                    # Data lives in an HTML-escaped data-* attribute that the handlers
+                    # read via `this.dataset.url`. Interpolating it into an inline
+                    # handler let an apostrophe in a scraped URL break out of the JS
+                    # string literal and destroy (or hijack) the whole script block.
+                    crm_controls_html = (
+                        f'<select class="select-input stage-select" data-url="{url}" onchange="updateJobStage(this, this.value)">'
+                        f'{opts}</select>'
+                        f'<button class="filter-btn" data-url="{url}" onclick="generatePrepAndOutreach(this)">⚡ Prep &amp; Outreach</button>'
+                        f'<button class="filter-btn" data-url="{url}" onclick="generateProofPacket(this)">🛡 Proof</button>'
+                    )
+
+                apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>' if apply_url else ""
+
+                handle.write(f"""
+                <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}"
+                     data-location="{location.lower()}" data-sponsor="{escape(sponsor_status)}"
+                     data-arrangement="{escape(work_arr)}" data-stage="{escape(crm_stage)}"
+                     data-url="{url}">
+                  <div class="card-header">
+                    <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{score if score > 0 else '–'}</span>
+                    <a href="{title_href}" class="job-title" target="_blank">{title}</a>
+                  </div>
+                  <div class="meta-row">{meta_html}</div>
+                  {sub_pills_html}
+                  {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
+                  {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
+                  {notes_html}
+                  <p class="desc-preview">{desc_preview}...</p>
+                  {drawers_html}
+                  <div class="card-footer">{crm_controls_html}{apply_html}</div>
+                </div>""")
+
             if current_score is not None:
                 handle.write("</div>")
-            score_color = "#10b981" if score >= 7 else ("#f59e0b" if score >= 5 else "#64748b")
-            score_label = {
-                10: "Perfect Match", 9: "Excellent Fit", 8: "Strong Fit",
-                7: "Good Fit", 6: "Moderate+", 5: "Moderate", 0: "Unscored / Discovered",
-            }.get(score, f"Score {score}")
-            count_at_score = score_dist.get(score, 0) if score > 0 else (total - scored)
-            handle.write(f"""
-            <h2 class="score-header" style="border-color:{score_color}">
-              <span class="score-badge" style="background:{score_color}">{score if score > 0 else '–'}</span>
-              {score_label} ({count_at_score} jobs)
-            </h2>
-            <div class="job-grid">""")
-            current_score = score
-
-        title = escape(j["title"] or "Untitled")
-        company = escape(j["company"] or j["site"] or "Employer")
-        url = escape(j["url"] or "")
-        salary = escape(j["salary"] or "")
-        location = escape(j["location"] or "")
-        site = escape(j["site"] or "")
-        site_color = colors.get(j["site"] or "", "#60a5fa")
-        apply_url = escape(j["application_url"] or j["url"] or "")
-        sponsor_status = j["sponsor_status"] or "unknown"
-        work_arr = j["work_arrangement"] or "onsite"
-        crm_stage = j["crm_stage"] or "discovered"
-        ats_pct = j["ats_coverage_pct"]
-
-        reasoning_raw = j["score_reasoning"] or ""
-        reasoning_lines = reasoning_raw.split("\n")
-        keywords = reasoning_lines[0][:140] if reasoning_lines else ""
-        reasoning = reasoning_lines[1][:240] if len(reasoning_lines) > 1 else ""
-
-        sub_pills_html = ""
-        if j["score_breakdown"]:
-            try:
-                bd = json.loads(j["score_breakdown"])
-                sub_pills_html = (
-                    f'<div class="subscore-row">'
-                    f'<span class="sub-pill">Skills: {bd.get("skills_score", "-")}</span>'
-                    f'<span class="sub-pill">Quals: {bd.get("qualifications_score", "-")}</span>'
-                    f'<span class="sub-pill">Domain: {bd.get("domain_score", "-")}</span>'
-                    f'<span class="sub-pill">Loc/Visa: {bd.get("location_score", "-")}</span>'
-                    f"</div>"
-                )
-            except Exception:
-                pass
-
-        meta_parts = [
-            f'<span class="meta-tag company-tag">{company}</span>',
-            f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>',
-        ]
-        if salary:
-            meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
-        if location:
-            meta_parts.append(f'<span class="meta-tag location">{location[:42]}</span>')
-        if ats_pct is not None:
-            meta_parts.append(f'<span class="meta-tag ats-tag">ATS: {ats_pct}%</span>')
-        if sponsor_status == "sponsorship_offered":
-            meta_parts.append('<span class="meta-tag sponsor-yes">★ Visa Sponsorship Offered</span>')
-        elif sponsor_status == "licensed_sponsor":
-            meta_parts.append('<span class="meta-tag sponsor-lic">✓ Licensed UK/EU Sponsor</span>')
-        elif sponsor_status == "no_sponsorship_stated":
-            meta_parts.append('<span class="meta-tag sponsor-no">⚠ No Sponsorship Stated</span>')
-        meta_parts.append(f'<span class="meta-tag arr-tag">{escape(work_arr.title())}</span>')
-        meta_parts.append(f'<span class="meta-tag stage-tag">{escape(crm_stage.upper())}</span>')
-        meta_html = " ".join(meta_parts)
-
-        full_text = j["full_description"] or j["description"] or ""
-        desc_preview = escape(full_text)[:280]
-        full_desc_html = escape(full_text).replace("\n", "<br>")
-        desc_len = len(full_text)
-
-        tailored_txt = _read_optional_file(j["tailored_resume_path"])
-        cover_txt = _read_optional_file(j["cover_letter_path"])
-        prep_txt = _read_optional_file(j["prep_pack_path"])
-        outreach_txt = _read_optional_file(j["outreach_path"])
-
-        drawers_html = ""
-        if full_text:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Full Description ({desc_len:,} chars)</summary>"
-                f"<div class='full-desc'>{full_desc_html}</div></details>"
-            )
-        if tailored_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Tailored CV Preview</summary>"
-                f"<div class='full-desc'>{escape(tailored_txt)}</div></details>"
-            )
-            if base_resume_txt:
-                drawers_html += (
-                    f"<details class='full-desc-details'><summary class='expand-btn'>"
-                    f"Base vs. Tailored CV Side-by-Side Diff</summary>"
-                    f"<div class='diff-grid'>"
-                    f"<div class='full-desc'><strong>Base CV</strong>\n\n{escape(base_resume_txt)}</div>"
-                    f"<div class='full-desc'><strong>Tailored CV (ATS: {ats_pct if ats_pct is not None else '-'}%)</strong>\n\n{escape(tailored_txt)}</div>"
-                    f"</div></details>"
-                )
-        if cover_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Cover Letter Preview</summary>"
-                f"<div class='full-desc'>{escape(cover_txt)}</div></details>"
-            )
-        if prep_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"Interview Prep Dossier</summary>"
-                f"<div class='full-desc'>{escape(prep_txt)}</div></details>"
-            )
-        if outreach_txt:
-            drawers_html += (
-                f"<details class='full-desc-details'><summary class='expand-btn'>"
-                f"LinkedIn & Cold Email Outreach</summary>"
-                f"<div class='full-desc'>{escape(outreach_txt)}</div></details>"
-            )
-
-        user_notes_txt = escape(j["user_notes"] or "")
-        notes_html = f'<div class="notes-box">📝 {user_notes_txt}</div>' if user_notes_txt else ""
-        if interactive_api:
-            notes_html += (
-                f'<div class="notes-edit-row">'
-                f'<input type="text" class="search-input notes-input" placeholder="Add CRM note / follow-up..." value="{user_notes_txt}" '
-                f'onchange="saveJobNote(\'{url}\', this.value)">'
-                f'</div>'
-            )
-
-        crm_controls_html = ""
-        if interactive_api:
-            stages_list = [
-                "discovered", "enriched", "scored", "tailored",
-                "ready_to_apply", "applied", "assessment", "interviewing", "offer", "rejected", "archived",
-            ]
-            opts = "".join(
-                f'<option value="{st}" {"selected" if st == crm_stage else ""}>{st.upper()}</option>'
-                for st in stages_list
-            )
-            crm_controls_html = (
-                f'<select class="select-input stage-select" onchange="updateJobStage(\'{url}\', this.value)">{opts}</select>'
-                f'<button class="filter-btn" onclick="generatePrepAndOutreach(\'{url}\', this)">⚡ Prep & Outreach</button>'
-                f'<button class="filter-btn" onclick="generateProofPacket(\'{url}\', this)">🛡 Proof</button>'
-            )
-
-        apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>' if apply_url else ""
-
-        handle.write(f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}"
-             data-location="{location.lower()}" data-sponsor="{escape(sponsor_status)}"
-             data-arrangement="{escape(work_arr)}" data-stage="{escape(crm_stage)}"
-             data-url="{url}">
-          <div class="card-header">
-            <span class="score-pill" style="background:{'#10b981' if score >= 7 else ('#f59e0b' if score >= 5 else '#64748b')}">{score if score > 0 else '–'}</span>
-            <a href="{url}" class="job-title" target="_blank">{title}</a>
-          </div>
-          <div class="meta-row">{meta_html}</div>
-          {sub_pills_html}
-          {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
-          {f'<div class="reasoning-row">{escape(reasoning)}</div>' if reasoning else ''}
-          {notes_html}
-          <p class="desc-preview">{desc_preview}...</p>
-          {drawers_html}
-          <div class="card-footer">{crm_controls_html}{apply_html}</div>
-        </div>""")
-
-    if current_score is not None:
-        handle.write("</div>")
-    handle.write(html_tail)
-    handle.close()
-    tmp_out.replace(out)
+            handle.write(html_tail)
+        tmp_out.replace(out)
+    except BaseException:
+        # F19: never leave a stale dashboard.html.tmp behind, and never let the
+        # open handle outlive a failed render. The previous dashboard is left
+        # untouched because the replace only runs on success.
+        tmp_out.unlink(missing_ok=True)
+        raise
+    finally:
+        jobs.close()
 
     abs_path = str(out.resolve())
     console.print(f"[green]Dashboard written to {abs_path}[/green]")

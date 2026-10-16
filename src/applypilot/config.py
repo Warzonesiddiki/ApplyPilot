@@ -11,8 +11,50 @@ from typing import Any
 
 import yaml
 
+# Reserved slug for the ROOT workspace (see list_profiles). It must never
+# resolve to the NAMED profiles/default directory.
+RESERVED_ROOT_PROFILE = "default"
+
+
+def _default_base_dir() -> Path:
+    """Return the fallback workspace root when APPLYPILOT_DIR is unusable."""
+    return Path.home() / ".applypilot"
+
+
+def _normalize_profile_name(profile_name: str | None) -> str | None:
+    """Normalize a profile slug, mapping the reserved 'default' slug to None.
+
+    ``default`` names the root workspace, so treating it as a named profile
+    would silently point the user at an empty ``<base>/profiles/default``
+    directory instead of their real workspace.
+    """
+    if profile_name is None:
+        return None
+    clean = profile_name.strip().lower()
+    if not clean or clean == RESERVED_ROOT_PROFILE:
+        return None
+    return clean
+
+
+def _base_dir_from_env() -> Path:
+    """Resolve the base workspace directory from ``APPLYPILOT_DIR``.
+
+    An empty (or whitespace-only) value would otherwise resolve to ``Path("")``
+    — the current working directory — and scatter ``applypilot.db``,
+    ``profile.json`` and ``resume.txt`` wherever the CLI happened to be
+    launched. Relative paths are rejected for the same reason.
+    """
+    raw = os.environ.get("APPLYPILOT_DIR", "").strip()
+    if not raw:
+        return _default_base_dir()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        return _default_base_dir()
+    return candidate
+
+
 # Base application directory — holds shared .env and profiles/ subdirectory
-BASE_APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
+BASE_APP_DIR = _base_dir_from_env()
 PROFILES_DIR = BASE_APP_DIR / "profiles"
 ACTIVE_PROFILE_FILE = BASE_APP_DIR / "active_profile"
 GLOBAL_ENV_PATH = BASE_APP_DIR / ".env"
@@ -22,7 +64,7 @@ PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
 
 # Active profile state
-_ACTIVE_PROFILE: str | None = os.environ.get("APPLYPILOT_PROFILE") or None
+_ACTIVE_PROFILE: str | None = _normalize_profile_name(os.environ.get("APPLYPILOT_PROFILE"))
 
 # Dynamic module-level paths (updated by set_active_profile / _refresh_paths)
 APP_DIR: Path = BASE_APP_DIR
@@ -55,25 +97,23 @@ LLM_ENV_KEYS: tuple[str, ...] = (
 def _get_base_dir() -> Path:
     """Return the base ApplyPilot directory, respecting APPLYPILOT_DIR or BASE_APP_DIR."""
     if "APPLYPILOT_DIR" in os.environ:
-        return Path(os.environ["APPLYPILOT_DIR"])
+        return _base_dir_from_env()
     return BASE_APP_DIR
 
 
 def _resolve_app_dir(profile_name: str | None = None) -> Path:
     """Resolve the active workspace directory based on profile selection."""
     base = _get_base_dir()
-    name = profile_name if profile_name is not None else _ACTIVE_PROFILE
-    if not name:
-        env_prof = os.environ.get("APPLYPILOT_PROFILE", "").strip()
-        if env_prof:
-            name = env_prof
-        elif (base / "active_profile").exists():
-            try:
-                saved = (base / "active_profile").read_text(encoding="utf-8").strip()
-                if saved:
-                    name = saved
-            except OSError:
-                pass
+    name = _normalize_profile_name(profile_name)
+    if name is None:
+        name = _ACTIVE_PROFILE
+    if name is None:
+        name = _normalize_profile_name(os.environ.get("APPLYPILOT_PROFILE"))
+    if name is None and (base / "active_profile").exists():
+        try:
+            name = _normalize_profile_name((base / "active_profile").read_text(encoding="utf-8"))
+        except OSError:
+            name = None
     if name:
         return base / "profiles" / name
     return base
@@ -113,15 +153,18 @@ def _refresh_paths(profile_name: str | None = None) -> Path:
 def set_active_profile(profile_name: str | None, persist: bool = False) -> Path:
     """Set the active candidate profile (e.g. 'tahir' or 'neha') and update paths.
 
+    The reserved slug ``default`` (and any empty value) selects the ROOT
+    workspace, never a named ``profiles/default`` directory.
+
     Args:
-        profile_name: Profile slug (or None for root legacy directory).
+        profile_name: Profile slug, or None/'default' for the root directory.
         persist: If True, write the profile name to ~/.applypilot/active_profile.
 
     Returns:
         Resolved APP_DIR for the profile.
     """
     global _ACTIVE_PROFILE
-    clean = profile_name.strip().lower() if profile_name else None
+    clean = _normalize_profile_name(profile_name)
     _ACTIVE_PROFILE = clean
     if clean:
         os.environ["APPLYPILOT_PROFILE"] = clean
@@ -135,18 +178,28 @@ def set_active_profile(profile_name: str | None, persist: bool = False) -> Path:
     return app_dir
 
 
+def clear_active_profile() -> Path:
+    """Return to the ROOT workspace and return the resolved APP_DIR.
+
+    ``default`` is the reserved name for the root workspace, so clearing the
+    active profile must never leave the CLI pointed at an empty
+    ``<base>/profiles/default`` directory.
+    """
+    return set_active_profile(None, persist=False)
+
+
 def get_active_profile() -> str | None:
     """Return the currently active profile slug, or None if using root."""
     if _ACTIVE_PROFILE:
         return _ACTIVE_PROFILE
-    env_prof = os.environ.get("APPLYPILOT_PROFILE", "").strip()
+    env_prof = _normalize_profile_name(os.environ.get("APPLYPILOT_PROFILE"))
     if env_prof:
         return env_prof
     base = _get_base_dir()
     af = base / "active_profile"
     if af.exists():
         try:
-            return af.read_text(encoding="utf-8").strip() or None
+            return _normalize_profile_name(af.read_text(encoding="utf-8"))
         except OSError:
             return None
     return None
@@ -160,7 +213,7 @@ def list_profiles() -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = [
         {
-            "name": "default",
+            "name": RESERVED_ROOT_PROFILE,
             "active": active is None,
             "app_dir": str(base),
             "has_profile": (base / "profile.json").exists(),
@@ -170,7 +223,9 @@ def list_profiles() -> list[dict[str, Any]]:
     ]
     if pdir.exists():
         for d in sorted(pdir.iterdir()):
-            if d.is_dir() and not d.name.startswith("."):
+            # "default" is the reserved root slug — a directory with that name is
+            # a legacy artifact and would otherwise render as a duplicate row.
+            if d.is_dir() and not d.name.startswith(".") and d.name != RESERVED_ROOT_PROFILE:
                 items.append(
                     {
                         "name": d.name,
@@ -557,7 +612,7 @@ def infer_country_indeed(location: str | None, default: str = "uk") -> str:
 # Default values — referenced across modules instead of magic numbers
 # ---------------------------------------------------------------------------
 
-DEFAULTS = {
+DEFAULTS: dict[str, Any] = {
     "min_score": 7,
     "max_apply_attempts": 3,
     "max_tailor_attempts": 5,
@@ -567,16 +622,54 @@ DEFAULTS = {
 }
 
 
+# Routing keys that decide WHERE the remaining .env layers live, so they have to
+# be known before any path constant can be resolved.
+_ROOT_ROUTING_ENV_KEYS: tuple[str, ...] = ("APPLYPILOT_DIR", "APPLYPILOT_PROFILE")
+
+
+def _preload_root_routing_keys() -> None:
+    """Seed APPLYPILOT_DIR/APPLYPILOT_PROFILE from the global ``<base>/.env``.
+
+    The global .env sits at ``BASE_APP_DIR/.env``, which depends only on the
+    process environment, so it can be read first without knowing the final
+    workspace. Without this, a workspace that *defines* its own location would
+    have its directory tree created in the fallback location before the value
+    was ever read.
+    """
+    from dotenv import dotenv_values
+
+    if GLOBAL_ENV_PATH == ENV_PATH or not GLOBAL_ENV_PATH.exists():
+        return
+    try:
+        values = dotenv_values(GLOBAL_ENV_PATH)
+    except OSError:
+        return
+    for key in _ROOT_ROUTING_ENV_KEYS:
+        raw = (values.get(key) or "").strip()
+        if raw and not os.environ.get(key):
+            os.environ[key] = raw
+
+
 def load_env() -> None:
-    """Load environment variables from profile .env, global ~/.applypilot/.env, and CWD .env."""
+    """Load environment variables from profile .env, global ~/.applypilot/.env, and CWD .env.
+
+    Paths are resolved *after* the dotenv layers are read so a workspace that
+    defines ``APPLYPILOT_DIR``/``APPLYPILOT_PROFILE`` in its own .env does not
+    have every module-level path switch mid-run.
+    """
     from dotenv import load_dotenv
 
+    _refresh_paths()
+    _preload_root_routing_keys()
     _refresh_paths()
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
     if GLOBAL_ENV_PATH.exists() and GLOBAL_ENV_PATH != ENV_PATH:
         load_dotenv(GLOBAL_ENV_PATH)
     load_dotenv()
+    # The dotenvs above may have introduced new routing keys; re-resolve before
+    # callers (and ensure_dirs) start creating directories.
+    _refresh_paths()
 
 
 # ---------------------------------------------------------------------------
@@ -659,6 +752,10 @@ def check_tier(required: int, feature: str) -> None:
     raise SystemExit(1)
 
 
+class WorkspaceNotInitializedError(RuntimeError):
+    """Raised when a command needs a profile the active workspace lacks."""
+
+
 def is_initialized() -> bool:
     """Return True if the active profile has profile.json or resume.txt."""
     _refresh_paths()
@@ -666,8 +763,24 @@ def is_initialized() -> bool:
 
 
 def require_init() -> None:
-    """Ensure the active profile workspace directories exist."""
+    """Ensure the active workspace exists and has been initialised.
+
+    Raises:
+        WorkspaceNotInitializedError: when ``profile.json`` or ``resume.txt``
+            is missing. Commands that genuinely need the candidate's data call
+            this so they fail immediately with an actionable message instead of
+            after hours of network discovery.
+    """
     ensure_dirs()
+    _refresh_paths()
+    missing = [path for path in (PROFILE_PATH, RESUME_PATH) if not path.exists()]
+    if missing:
+        prof = get_active_profile()
+        hint = f"applypilot -p {prof} init" if prof else "applypilot init"
+        raise WorkspaceNotInitializedError(
+            f"ApplyPilot workspace is not initialised — missing "
+            f"{', '.join(str(path) for path in missing)}. Run `{hint}` first."
+        )
 
 
 def has_llm_configured() -> bool:

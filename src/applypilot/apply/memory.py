@@ -192,43 +192,87 @@ def build_memory_prompt_section(
 # Smart Apply Error Classifier & Transient Retry
 # ---------------------------------------------------------------------------
 
+# Transient failures: the job is still open and worth retrying. These free-text
+# markers are matched anywhere in `apply_error` because they are exception prose.
+_RETRYABLE_MARKERS: tuple[str, ...] = (
+    "timeout", "timed out", "network", "connection", "rate_limit", "rate limit",
+    "429", "502", "503", "504", "crash", "crashed", "detached", "navigation",
+    "in_progress", "protocol error", "closed", "expired", "filled", "token",
+    "session", "browser closed", "target closed", "no result", "interrupted",
+)
+
+# Permanent failures are only recognised from the structured reason codes the apply
+# agent emits (RESULT:FAILED:<code>) or from an exact standalone code. Bare
+# substrings such as "closed"/"expired"/"filled"/"404" used to live here, which made
+# "connection closed by peer", "token expired" and "target closed" permanent and
+# stopped `--retry-transient` from ever retrying them.
+_PERMANENT_REASON_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"not_eligible"
+    r"|no_sponsorship"
+    r"|manual_ats"
+    r"|site_blocked"
+    r"|security_clearance"
+    r"|not_a_job_application"
+    r"|already_applied"
+    r"|account_required"
+    r"|unsafe_permissions|unsafe_verification"
+    r"|sso_required"
+    r"|no_longer_available"
+    r")\w*"
+)
+
+# Standalone permanent codes. These are matched whole so free text that merely
+# contains the word (e.g. "connection closed by peer") stays retryable.
+_PERMANENT_EXACT_REASONS: frozenset[str] = frozenset({
+    "expired", "closed", "filled", "404", "http_404", "http 404",
+    "manual ats", "no longer available", "no longer accepting",
+    "no longer accepting applications", "position filled",
+})
+
+_RESULT_ENVELOPE_PREFIXES: tuple[str, ...] = ("result:failed:", "result:failed", "result:", "failed:")
+
+
+def _reason_code(error_str: str) -> str:
+    """Strip the agent's `RESULT:` envelope to expose the bare reason code."""
+    lowered = error_str.strip().lower()
+    for prefix in _RESULT_ENVELOPE_PREFIXES:
+        if lowered.startswith(prefix):
+            return lowered[len(prefix) :].strip()
+    return lowered
+
+
 def classify_apply_error(error_str: str | None) -> str:
     """Classify an `apply_error` string into an actionable bucket.
 
     Buckets:
-      - 'retryable': timeout, network, rate limit, browser crash, element detached, 502/503
+      - 'retryable': timeout, network, rate limit, browser crash, element detached,
+        closed/expired *transport* failures ("connection closed by peer",
+        "token expired", "target closed")
       - 'captcha_blocked': captcha, turnstile, recaptcha, hcaptcha, cloudflare
       - 'auth_or_sso': sso, verification code, login required, account locked
-      - 'permanent_ineligible': not_eligible, expired, closed, no_sponsorship, manual_ats
+      - 'permanent_ineligible': a structured permanent code only — not_eligible*,
+        expired, closed, filled, 404, no_sponsorship, manual_ats, site_blocked
       - 'other': uncategorized failure
+
+    Permanent detection is anchored to the reason code the agent emits, so it can
+    never shadow the transient browser/network failures a retry exists for.
     """
     if not error_str:
         return "other"
     err = error_str.lower()
+    reason = _reason_code(error_str)
 
-    if any(
-        k in err
-        for k in (
-            "not_eligible", "expired", "closed", "no_sponsorship", "manual_ats",
-            "security_clearance", "filled", "404", "no longer available",
-        )
-    ):
-        return "permanent_ineligible"
-
-    if any(k in err for k in ("captcha", "turnstile", "recaptcha", "hcaptcha", "cloudflare", "bot_detected")):
+    if any(k in reason for k in ("captcha", "turnstile", "recaptcha", "hcaptcha", "cloudflare", "bot_detected")):
         return "captcha_blocked"
 
-    if any(k in err for k in ("sso", "verification_code", "login_required", "account_locked", "otp", "two_factor")):
+    if any(k in reason for k in ("sso", "verification_code", "login_required", "account_locked", "otp", "two_factor")):
         return "auth_or_sso"
 
-    if any(
-        k in err
-        for k in (
-            "timeout", "timed out", "network", "connection", "rate_limit", "429",
-            "502", "503", "504", "crash", "detached", "navigation", "in_progress",
-            "target closed", "protocol error",
-        )
-    ):
+    if _PERMANENT_REASON_PREFIX_RE.match(reason) or reason in _PERMANENT_EXACT_REASONS:
+        return "permanent_ineligible"
+
+    if any(k in err for k in _RETRYABLE_MARKERS):
         return "retryable"
 
     return "other"
@@ -241,7 +285,9 @@ def reset_transient_failed_jobs(
     """Reset failed jobs whose `apply_error` is classified as transient/retryable.
 
     Preserves `permanent_ineligible` failures so closed or ineligible roles are
-    never re-attempted.
+    never re-attempted. Every column a previous attempt owned is cleared, not just
+    `apply_error`/`apply_status`/`apply_attempts`, so a reset job carries no stale
+    agent lock into the next run.
     """
     if conn is None:
         conn = get_connection()
@@ -254,6 +300,8 @@ def reset_transient_failed_jobs(
     reset_count = 0
     by_bucket: dict[str, int] = {}
     last_rowid = 0
+
+    reset_sql = _build_reset_sql(conn)
 
     # Scan failed jobs in bounded rowid windows: the URL/error pairs are small,
     # but a large failed backlog should not be materialized in one result set.
@@ -273,10 +321,7 @@ def reset_transient_failed_jobs(
             bucket = classify_apply_error(str(row[2]))
             by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
             if bucket in allowed_buckets:
-                conn.execute(
-                    "UPDATE jobs SET apply_error = NULL, apply_status = NULL, apply_attempts = 0 WHERE url = ?",
-                    (row[1],),
-                )
+                conn.execute(reset_sql, (row[1],))
                 reset_count += 1
         conn.commit()
 
@@ -285,3 +330,20 @@ def reset_transient_failed_jobs(
         "reset_count": reset_count,
         "by_bucket": by_bucket,
     }
+
+
+# Columns a completed attempt owns. They are cleared together on reset so a job
+# cannot stay locked by a previous run.
+_RESETTABLE_LOCK_COLUMNS: tuple[str, ...] = ("agent_id", "apply_task_id", "apply_duration_ms", "last_attempted_at")
+
+
+def _build_reset_sql(conn: sqlite3.Connection) -> str:
+    """Build the reset UPDATE, keeping only lock columns this schema actually has."""
+    try:
+        existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    except sqlite3.Error:  # pragma: no cover - defensive
+        existing = set()
+    columns = [name for name in _RESETTABLE_LOCK_COLUMNS if name in existing]
+    assignments = ["apply_error = NULL", "apply_status = NULL", "apply_attempts = 0"]
+    assignments.extend(f"{name} = NULL" for name in columns)
+    return f"UPDATE jobs SET {', '.join(assignments)} WHERE url = ?"

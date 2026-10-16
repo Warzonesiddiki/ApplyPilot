@@ -10,6 +10,7 @@ visa sponsorship / relocation rules, and both Tech and ACA/Finance domains.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -261,9 +262,13 @@ def _build_hard_rules(profile: dict[str, Any]) -> str:
     personal = profile.get("personal", {})
     work_auth = profile.get("work_authorization", {})
 
-    full_name = personal.get("full_name", "Candidate")
+    # `full_name` is user-supplied JSON: it may be missing, null, or whitespace.
+    # `dict.get(k, default)` returns None when the key exists with a null value, so
+    # the `or ""` fallback and the strip are both required before splitting.
+    full_name = str(personal.get("full_name") or "").strip() or "Candidate"
     clean_parts = full_name.split(",")[0].strip().split()
-    preferred_name = personal.get("preferred_name") or (clean_parts[0] if clean_parts else full_name)
+    first_token = clean_parts[0] if clean_parts else full_name
+    preferred_name = str(personal.get("preferred_name") or "").strip() or first_token
     preferred_last = clean_parts[-1] if len(clean_parts) > 1 else ""
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
@@ -275,7 +280,7 @@ def _build_hard_rules(profile: dict[str, Any]) -> str:
         work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
 
     name_rule = f"Name: Legal name = {full_name}."
-    if preferred_name and preferred_name != full_name.split()[0]:
+    if preferred_name and preferred_name != first_token:
         name_rule += f' Preferred name = {preferred_name}. Use "{display_name}" unless a field specifically says "legal name".'
 
     return f"""== HARD RULES (never break these) ==
@@ -483,8 +488,8 @@ def build_prompt(
         raise ValueError(f"Resume PDF not found: {src_pdf}")
 
     # Copy to a clean, per-worker isolated directory for upload
-    full_name = personal["full_name"]
-    name_slug = full_name.split(",")[0].strip().replace(" ", "_")
+    full_name = str(personal.get("full_name") or "").strip() or "Candidate"
+    name_slug = re.sub(r"[^\w\s-]", "", full_name.split(",")[0]).strip().replace(" ", "_") or "Candidate"
     dest_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}" / "uploads"
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
@@ -535,7 +540,9 @@ def build_prompt(
     blocked_sso = load_blocked_sso()
 
     clean_name_parts = full_name.split(",")[0].strip().split()
-    preferred_name = personal.get("preferred_name") or (clean_name_parts[0] if clean_name_parts else full_name)
+    preferred_name = str(personal.get("preferred_name") or "").strip() or (
+        clean_name_parts[0] if clean_name_parts else full_name
+    )
     last_name = clean_name_parts[-1] if len(clean_name_parts) > 1 else ""
     display_name = f"{preferred_name} {last_name}".strip()
 

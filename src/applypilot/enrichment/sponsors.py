@@ -65,6 +65,31 @@ LICENSED_UK_EU_SPONSORS: tuple[str, ...] = (
     "ryanair", "crh", "flutter", "entain", "thomson reuters", "finnet",
 )
 
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _build_sponsor_patterns() -> tuple[re.Pattern[str], ...]:
+    """Compile the sponsor registry once into word-boundary matchers.
+
+    The registry entries are bare tokens or short phrases ("pwc", "sap",
+    "legal & general"). Substring matching against them produced mass false
+    positives -- "Advertising" matched the trailing-space entry ``"ing "``,
+    "Sappi" matched ``"sap"`` and "Pineapple" matched ``"apple"``. Anchoring
+    every entry with non-word lookarounds keeps real matches ("EY", "BP",
+    "SAP SE") while rejecting those coincidences. ``&`` counts as a word
+    character so multi-word entries such as "legal & general" still match.
+    """
+    patterns: list[re.Pattern[str]] = []
+    for entry in LICENSED_UK_EU_SPONSORS:
+        token = _WHITESPACE_RUN.sub(" ", entry.strip().lower())
+        if not token:
+            continue
+        patterns.append(re.compile(rf"(?<![a-z0-9&]){re.escape(token)}(?![a-z0-9&])"))
+    return tuple(patterns)
+
+
+_SPONSOR_PATTERNS: tuple[re.Pattern[str], ...] = _build_sponsor_patterns()
+
 _NO_SPONSORSHIP_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
@@ -124,8 +149,10 @@ def is_licensed_sponsor(company: str | None) -> bool:
     """Return True if the company matches a known UK Home Office or EU Recognized Sponsor."""
     if not company:
         return False
-    comp = f" {company.strip().lower()} "
-    return any(sp in comp for sp in LICENSED_UK_EU_SPONSORS)
+    name = _WHITESPACE_RUN.sub(" ", company.strip().lower())
+    if not name:
+        return False
+    return any(pattern.search(name) for pattern in _SPONSOR_PATTERNS)
 
 
 def detect_sponsor_status(
